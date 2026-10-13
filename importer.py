@@ -54,6 +54,30 @@ EXPLICIT_HEADER_TO_COLUMN = {
     "标签": "label",
 }
 
+SPECIAL_HEADER_TO_COLUMN = {
+    "销售建议": "remark",
+    "国家": "country_name",
+}
+
+COLUMN_ALIASES = {
+    "asin": ["ASIN"],
+    "country_name": ["国家"],
+    "remark": ["销售建议"],
+    "title": ["标题"],
+    "name": ["产品"],
+    "seller_sku": ["seller_sku"],
+    "point": ["五点"],
+    "senior_a": ["A+"],
+    "group": ["小组"],
+    "select_date": ["接手月份"],
+    "obsolete_date": ["淘汰月份"],
+    "status": ["状态"],
+    "ad_activity": ["广告"],
+    "deal": ["活动"],
+    "deal_date": ["活动开始时间"],
+    "asin_country": ["ASIN+国家"],
+}
+
 KEY_COLUMNS = {"asin", "country"}
 SOURCE_TEXT_COLUMNS = {
     "title",
@@ -83,6 +107,7 @@ class ImportStats:
     updated_existing_rows: int = 0
     obsoleted_rows: int = 0
     reactivated_rows: int = 0
+    skipped_existing: int = 0
     skipped_duplicate_in_file: int = 0
     skipped_missing_key: int = 0
 
@@ -90,7 +115,7 @@ class ImportStats:
 def normalize_name(value: Any) -> str:
     text = "" if value is None else str(value)
     text = text.strip().lower()
-    text = re.sub(r"[\s_\-./\\:：,，;；()（）\[\]【】+]+", "", text)
+    text = re.sub(r"[\s_\-./\\:：,，;；()（）\[\]【】]+", "", text)
     return text
 
 
@@ -130,7 +155,6 @@ def normalize_boolean(value: Any) -> int | None:
         return None
     if isinstance(value, bool):
         return int(value)
-
     text = str(value).strip().lower()
     if text in {"是", "有", "已完成", "完成", "yes", "y", "true", "1"}:
         return 1
@@ -220,6 +244,19 @@ def build_excel_header_index(headers: list[str]) -> dict[str, str]:
     return index
 
 
+def find_header_for_column(column: str, header_index: dict[str, str]) -> str | None:
+    normalized_column = normalize_name(column)
+    if normalized_column in header_index:
+        return header_index[normalized_column]
+
+    for alias in COLUMN_ALIASES.get(column, []):
+        normalized_alias = normalize_name(alias)
+        if normalized_alias in header_index:
+            return header_index[normalized_alias]
+
+    return None
+
+
 def build_column_mapping(
     excel_headers: list[str],
     db_columns: list[str],
@@ -228,17 +265,26 @@ def build_column_mapping(
     db_column_set = set(db_columns)
     mapping: dict[str, str] = {}
 
-    for excel_header, db_column in EXPLICIT_HEADER_TO_COLUMN.items():
-        normalized_header = normalize_name(excel_header)
-        if db_column in db_column_set and normalized_header in header_index:
-            mapping[db_column] = header_index[normalized_header]
+    for excel_header, db_column in {
+        **EXPLICIT_HEADER_TO_COLUMN,
+        **SPECIAL_HEADER_TO_COLUMN,
+    }.items():
+        if db_column in db_column_set and normalize_name(excel_header) in header_index:
+            mapping[db_column] = header_index[normalize_name(excel_header)]
+
+    for db_column in db_columns:
+        if db_column in mapping or db_column == "country":
+            continue
+        header = find_header_for_column(db_column, header_index)
+        if header:
+            mapping[db_column] = header
 
     mapped_headers = set(mapping.values())
-    country_source = header_index.get(normalize_name(COUNTRY_SOURCE_HEADER))
-    if country_source:
-        mapped_headers.add(country_source)
-
-    unmapped_headers = [header for header in excel_headers if header not in mapped_headers]
+    unmapped_headers = [
+        header
+        for header in excel_headers
+        if header not in mapped_headers and normalize_name(header) != normalize_name(COUNTRY_SOURCE_HEADER)
+    ]
     return mapping, unmapped_headers
 
 
@@ -264,9 +310,8 @@ def collect_candidate_rows(
     stats = ImportStats(total_rows=len(df))
     rows: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
-    header_index = build_excel_header_index(list(df.columns))
 
-    short_header = header_index.get(normalize_name(COUNTRY_SOURCE_HEADER))
+    short_header = build_excel_header_index(list(df.columns)).get(normalize_name(COUNTRY_SOURCE_HEADER))
     asin_header = mapping.get("asin")
 
     for _, excel_row in df.iterrows():
@@ -285,6 +330,9 @@ def collect_candidate_rows(
 
         db_row: dict[str, Any] = {}
         for db_column, excel_header in mapping.items():
+            # Lifecycle fields are managed by synchronization, not by Excel.
+            if db_column in {"status", "obsolete_date"}:
+                continue
             value = normalize_db_value(db_column, get_cell(excel_row, excel_header))
             if value is not None:
                 db_row[db_column] = value
@@ -304,6 +352,27 @@ def collect_candidate_rows(
     return rows, stats
 
 
+def fetch_existing_keys(connection, table: str, rows: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    if not rows:
+        return set()
+
+    keys = [(str(row["asin"]), str(row["country"])) for row in rows]
+    existing: set[tuple[str, str]] = set()
+    select_sql = (
+        f"SELECT asin, country FROM {quote_identifier(table)} "
+        "WHERE asin = %s AND country = %s LIMIT 1"
+    )
+
+    with connection.cursor() as cursor:
+        for asin, country in keys:
+            cursor.execute(select_sql, (asin, country))
+            row = cursor.fetchone()
+            if row:
+                existing.add((str(row["asin"]), str(row["country"])))
+
+    return existing
+
+
 def fetch_existing_rows(connection, table: str) -> dict[tuple[str, str], dict[str, Any]]:
     existing: dict[tuple[str, str], dict[str, Any]] = {}
     with connection.cursor() as cursor:
@@ -312,7 +381,6 @@ def fetch_existing_rows(connection, table: str) -> dict[tuple[str, str], dict[st
             key = (str(row.get("asin") or "").strip(), str(row.get("country") or "").strip())
             if key not in existing:
                 existing[key] = row
-
     return existing
 
 
@@ -367,7 +435,6 @@ def update_row_by_key(
 ) -> int:
     if not updates:
         return 0
-
     set_sql = ", ".join(f"{quote_identifier(column)} = %s" for column in updates)
     sql = (
         f"UPDATE {quote_identifier(table)} "
@@ -375,7 +442,6 @@ def update_row_by_key(
         "WHERE asin = %s AND country = %s"
     )
     params = [*updates.values(), *key]
-
     with connection.cursor() as cursor:
         cursor.execute(sql, params)
         return cursor.rowcount
@@ -445,7 +511,7 @@ def import_excel_data(
     batch_size: int = 500,
     dry_run: bool = False,
 ) -> tuple[ImportStats, list[str]]:
-    """Import one Excel file and return import statistics plus unmapped headers."""
+    """Synchronize the first Excel sheet with product data in one transaction."""
     df = read_excel_first_sheet(excel_path)
     columns = fetch_columns(connection, table)
     db_columns = insertable_columns(columns)
@@ -503,17 +569,10 @@ def import_excel_data(
 
     try:
         updated, reactivated = update_existing_imported_fields(
-            connection,
-            table,
-            rows,
-            existing_rows,
+            connection, table, rows, existing_rows,
         )
         obsoleted = mark_obsolete_rows(
-            connection,
-            table,
-            source_keys,
-            existing_rows,
-            sync_day,
+            connection, table, source_keys, existing_rows, sync_day,
         )
         stats.updated_existing_rows = updated
         stats.reactivated_rows = reactivated
