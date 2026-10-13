@@ -13,6 +13,7 @@ import tempfile
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 import pymysql
@@ -33,6 +34,11 @@ except Exception:  # pragma: no cover
     EdgeOptions = None
 
 from .importer import DEFAULT_DATABASE, connect, quote_identifier
+
+
+DETAIL_FOUND = "detail_found"
+DETAIL_EMPTY = "detail_empty"
+DETAIL_UNKNOWN = "fetch_unknown"
 
 
 SITE_LOCALE_MAP = {
@@ -113,25 +119,48 @@ class CrawlMetric:
     bsr: str | None = None
     inventory: str | None = None
     follow_sale: str | None = None
+    detail_status: str = DETAIL_UNKNOWN
+    offer_verified: bool = False
 
     def merge(self, other: "CrawlMetric") -> None:
-        for field_name in ("buy_box", "price", "star", "reviews", "bsr", "inventory", "follow_sale"):
+        # A confirmed cart offer takes precedence over a sparse page that only
+        # established a no-cart state. Price and cart must move together so a
+        # price from another offer can never be merged into a no-cart result.
+        if other.offer_verified:
+            self.offer_verified = True
+            if other.buy_box == 1:
+                self.buy_box = 1
+                if other.price is not None:
+                    self.price = other.price
+            elif self.buy_box is None and other.buy_box is not None:
+                self.buy_box = other.buy_box
+
+        for field_name in ("star", "reviews", "bsr", "inventory", "follow_sale"):
             if getattr(self, field_name) is None:
                 value = getattr(other, field_name)
                 if value is not None:
                     setattr(self, field_name, value)
+        self.merge_detail_status(other)
 
     def is_complete(self) -> bool:
-        return all(
+        base_complete = all(
             getattr(self, field_name) is not None
-            for field_name in ("buy_box", "price", "star", "reviews", "bsr", "inventory")
+            for field_name in ("buy_box", "star", "reviews", "bsr")
         )
+        price_complete = self.buy_box == 0 or self.price is not None
+        return base_complete and price_complete
 
     def has_any_value(self) -> bool:
         return any(
             getattr(self, field_name) is not None
             for field_name in ("buy_box", "price", "star", "reviews", "bsr", "inventory", "follow_sale")
         )
+
+    def merge_detail_status(self, other: "CrawlMetric") -> None:
+        if other.detail_status == DETAIL_FOUND:
+            self.detail_status = DETAIL_FOUND
+        elif self.detail_status == DETAIL_UNKNOWN and other.detail_status == DETAIL_EMPTY:
+            self.detail_status = DETAIL_EMPTY
 
 
 @dataclass
@@ -171,6 +200,8 @@ class CrawlRecord:
                 "bsr": self.metrics.bsr,
                 "inventory": self.metrics.inventory,
                 "follow_sale": self.metrics.follow_sale,
+                "detail_status": self.metrics.detail_status,
+                "offer_verified": self.metrics.offer_verified,
             },
             "attempts": [attempt.__dict__ for attempt in self.attempts],
             "db_action": self.db_action,
@@ -257,10 +288,55 @@ def get_currency(country_code: str) -> str:
 
 
 def price_matches_site(price: str, country_code: str) -> bool:
-    lowered = price.lower()
-    if any(token in lowered for token in ("cny", "cn¥", "rmb", "人民币")):
+    code = country_code.upper()
+    lowered = price.lower().replace("\u00a0", " ")
+    expected_codes = SITE_CURRENCY_CODES.get(code)
+    if not expected_codes:
+        return False
+    expected_code = next(iter(expected_codes))
+
+    # Explicit currency codes are unambiguous and must belong to the site.
+    found_codes = set(re.findall(
+        r"\b(?:USD|MXN|EUR|GBP|CAD|AUD|CNY|RMB|JPY|INR|BRL|KRW)\b",
+        lowered.upper(),
+    ))
+    if found_codes and expected_code not in found_codes:
+        return False
+
+    # Handle country-qualified dollar symbols (US$, MX$, CA$, AU$), as well
+    # as the generic '$' used by several Amazon locales.
+    dollar_markers = re.findall(r"(?:us|mx|ca|au)\$|\$", lowered)
+    if dollar_markers:
+        expected_dollar_marker = {
+            "U": "us$",
+            "M": "mx$",
+            "C": "ca$",
+            "A": "au$",
+        }.get(code)
+        if expected_dollar_marker and any(
+            marker != "$" and marker != expected_dollar_marker
+            for marker in dollar_markers
+        ):
+            return False
+        if code not in {"U", "M", "C", "A"}:
+            return False
+
+    if "\u20ac" in price and expected_code != "EUR":
+        return False
+    if "\u00a3" in price and expected_code != "GBP":
+        return False
+    if any(token in lowered for token in ("cny", "rmb", "cn¥", "人民币", "元")):
+        return False
+    if any(symbol in price for symbol in ("¥", "￥", "₹", "₽", "₩")):
         return False
     return True
+
+
+def format_site_price(value: str, currency: str) -> str:
+    value = normalize_space(value) or ""
+    if re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?", value) and currency:
+        return f"{currency}{value}"
+    return value
 
 
 def get_postal_code(country_code: str) -> str:
@@ -307,6 +383,11 @@ def fetch_requests_html(session: requests.Session, url: str, locale: str) -> str
         },
     )
     response.raise_for_status()
+    country_code = country_from_url(url)
+    if not url_matches_site(response.url, country_code):
+        raise RuntimeError(
+            f"Amazon site mismatch: expected {get_site_domain(country_code)}, got {response.url}"
+        )
     html = response.text
     if is_blocked_html(html):
         raise RuntimeError("blocked by Amazon captcha or robot check")
@@ -352,7 +433,6 @@ def fetch_curl_html(url: str, locale: str) -> str:
         "--location",
         "--silent",
         "--show-error",
-        "--compressed",
         "--http1.1",
         "--max-time",
         "25",
@@ -372,6 +452,10 @@ def fetch_curl_html(url: str, locale: str) -> str:
         "Pragma: no-cache",
         "-H",
         "Upgrade-Insecure-Requests: 1",
+        # Do not ask this Windows curl build to decompress the response. Some
+        # bundled libcurl versions reject --compressed before making a request.
+        "-H",
+        "Accept-Encoding: identity",
     ]
     cookie_file = os.getenv("AMAZON_COOKIE_FILE", "").strip()
     cookie_path = Path(cookie_file) if cookie_file else get_curl_cookie_jar(country_from_url(url))
@@ -412,7 +496,6 @@ def set_delivery_location_curl(country_code: str, locale: str) -> None:
         "--location",
         "--silent",
         "--show-error",
-        "--compressed",
         "--http1.1",
         "--max-time",
         "15",
@@ -469,16 +552,19 @@ def create_selenium_driver(locale: str):
     if webdriver is None:
         raise RuntimeError("selenium webdriver unavailable")
 
-    temp_root = Path(__file__).resolve().parent.parent / ".selenium_tmp"
-    temp_root.mkdir(exist_ok=True)
-    persistent_profile = os.getenv("AMAZON_SELENIUM_PROFILE_DIR", "").strip()
-    if persistent_profile:
-        profile_context = None
-        profile_dir = str(Path(persistent_profile).resolve())
-        Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    else:
-        profile_context = tempfile.TemporaryDirectory(prefix="amazon_selenium_", dir=str(temp_root))
-        profile_dir = profile_context.name
+    debugger_address = os.getenv("AMAZON_SELENIUM_DEBUGGER_ADDRESS", "").strip()
+    profile_context = None
+    profile_dir = None
+    if not debugger_address:
+        temp_root = Path(__file__).resolve().parent.parent / ".selenium_tmp"
+        temp_root.mkdir(exist_ok=True)
+        persistent_profile = os.getenv("AMAZON_SELENIUM_PROFILE_DIR", "").strip()
+        if persistent_profile:
+            profile_dir = str(Path(persistent_profile).resolve())
+            Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        else:
+            profile_context = tempfile.TemporaryDirectory(prefix="amazon_selenium_", dir=str(temp_root))
+            profile_dir = profile_context.name
 
     try:
         browser = os.getenv("AMAZON_SELENIUM_BROWSER", "edge").strip().lower()
@@ -496,28 +582,34 @@ def create_selenium_driver(locale: str):
         else:
             raise RuntimeError("selenium browser options unavailable")
 
-        headless = os.getenv("AMAZON_SELENIUM_HEADLESS", "1").lower() not in {"0", "false", "no"}
-        if headless:
-            options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-background-networking")
-        options.add_argument("--disable-features=Translate,AutomationControlled")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-popup-blocking")
-        options.add_argument("--remote-debugging-port=0")
-        options.add_argument("--window-size=1600,2400")
-        options.add_argument(f"--user-agent={USER_AGENT}")
-        options.add_argument(f"--user-data-dir={profile_dir}")
-        options.add_argument("--profile-directory=Default")
-        options.add_argument(f"--lang={locale.split(',')[0]}")
+        if debugger_address:
+            # Attach to the user's already-running browser. Do not add a
+            # profile, headless, or remote-debugging argument in this mode.
+            options.add_experimental_option("debuggerAddress", debugger_address)
+        else:
+            headless = os.getenv("AMAZON_SELENIUM_HEADLESS", "1").lower() not in {"0", "false", "no"}
+            if headless:
+                options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-background-networking")
+            options.add_argument("--disable-features=Translate,AutomationControlled")
+            options.add_argument("--no-first-run")
+            options.add_argument("--no-default-browser-check")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--remote-debugging-port=0")
+            options.add_argument("--window-size=1600,2400")
+            options.add_argument(f"--user-agent={USER_AGENT}")
+            options.add_argument(f"--user-data-dir={profile_dir}")
+            options.add_argument("--profile-directory=Default")
+            options.add_argument(f"--lang={locale.split(',')[0]}")
 
         driver = driver_factory(options=options)
         page_timeout = float(os.getenv("AMAZON_SELENIUM_PAGE_TIMEOUT", "15"))
         driver.set_page_load_timeout(page_timeout)
+        driver._codex_attached = bool(debugger_address)
         return driver, profile_context
     except Exception:
         if profile_context is not None:
@@ -527,27 +619,47 @@ def create_selenium_driver(locale: str):
 
 def close_selenium_driver(driver, profile_context) -> None:
     try:
-        if driver is not None:
+        if driver is not None and not getattr(driver, "_codex_attached", False):
             driver.quit()
     finally:
         if profile_context is not None:
             profile_context.cleanup()
 
 
-def fetch_selenium_html(url: str, locale: str, driver=None) -> str:
+def fetch_selenium_html(
+    url: str,
+    locale: str,
+    driver=None,
+    country_code: str | None = None,
+    require_location: bool = True,
+) -> str:
     owns_driver = driver is None
     profile_context = None
+    expected_country = country_code or country_from_url(url)
     if owns_driver:
         driver, profile_context = create_selenium_driver(locale)
 
     try:
         if owns_driver:
-            country_code = country_from_url(url)
-            set_delivery_location_selenium(driver, country_code, locale)
+            if not set_delivery_location_selenium(driver, expected_country, locale):
+                raise RuntimeError(
+                    f"delivery postal verification failed for {get_site_domain(expected_country)} "
+                    f"({get_postal_code(expected_country)})"
+                )
         driver.get(url)
         wait_seconds = float(os.getenv("AMAZON_SELENIUM_WAIT_SECONDS", "3"))
         if wait_seconds > 0:
             time.sleep(wait_seconds)
+        if not url_matches_site(driver.current_url, expected_country):
+            raise RuntimeError(
+                f"Amazon site mismatch: expected {get_site_domain(expected_country)}, "
+                f"got {driver.current_url}"
+            )
+        if require_location and not _delivery_location_matches(driver, expected_country):
+            raise RuntimeError(
+                f"delivery postal verification failed on product page for "
+                f"{get_site_domain(expected_country)} ({get_postal_code(expected_country)})"
+            )
         html = driver.page_source
         if is_blocked_html(html):
             raise RuntimeError("blocked by Amazon captcha or robot check")
@@ -569,22 +681,61 @@ def shared_selenium_driver():
 
 
 def country_from_url(url: str) -> str:
-    lowered = url.lower()
+    hostname = (urlparse(url).hostname or "").casefold()
+    normalized_host = hostname[4:] if hostname.startswith("www.") else hostname
     for country_code, domain in SITE_DOMAIN_MAP.items():
-        if domain in lowered:
+        normalized_domain = domain.casefold()
+        if normalized_domain.startswith("www."):
+            normalized_domain = normalized_domain[4:]
+        if normalized_host == normalized_domain:
             return country_code
     return "U"
 
 
-def set_delivery_location_selenium(driver, country_code: str, locale: str) -> None:
+def url_matches_site(url: str, country_code: str) -> bool:
+    hostname = (urlparse(url).hostname or "").casefold()
+    expected = get_site_domain(country_code).casefold()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    if expected.startswith("www."):
+        expected = expected[4:]
+    return bool(hostname) and hostname == expected
+
+
+def set_delivery_location_selenium(driver, country_code: str, locale: str) -> bool:
+    """Set Amazon's delivery postal code inside the browser session.
+
+    The delivery endpoint must be called from the matching Amazon domain so
+    that its cookies are written to the same browser profile that will load
+    the product.  Return only after the browser confirms a successful HTTP
+    response; silently continuing here can produce a valid-looking but
+    wrong-region price.
+    """
     postal_code = get_postal_code(country_code)
     domain = get_site_domain(country_code)
     endpoint = f"https://{domain}/gp/delivery/ajax/address-change.html"
+    driver.get(f"https://{domain}/")
+    time.sleep(2)
+    _dismiss_cookie_consent(driver)
+    time.sleep(1)
+    if _delivery_location_matches(driver, country_code):
+        return True
+
+    # First try Amazon's own AJAX endpoint from the page context. Some Amazon
+    # locales accept the request but do not update the visible header, so the
+    # result is only trusted after the header verification below.
     try:
-        driver.get(f"https://{domain}/")
         script = """
-            const [endpoint, body] = arguments;
+            const [endpoint, postalCode] = arguments;
             const done = arguments[arguments.length - 1];
+            const params = new URLSearchParams({
+                locationType: "LOCATION_INPUT",
+                zipCode: postalCode,
+                storeContext: "generic",
+                deviceType: "web",
+                pageType: "Detail",
+                actionSource: "glow"
+            });
             fetch(endpoint, {
                 method: "POST",
                 credentials: "include",
@@ -592,25 +743,359 @@ def set_delivery_location_selenium(driver, country_code: str, locale: str) -> No
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "X-Requested-With": "XMLHttpRequest"
                 },
-                body
-            }).then(() => done(true)).catch(() => done(false));
+                body: params.toString()
+            }).then(response => {
+                done(JSON.stringify({ok: response.ok, status: response.status}));
+            }).catch(error => done(JSON.stringify({ok: false, error: String(error)})));
         """
-        body = (
-            "locationType=LOCATION_INPUT"
-            f"&zipCode={postal_code.replace(' ', '+')}"
-            "&storeContext=generic"
-            "&deviceType=web"
-            "&pageType=Detail"
-            "&actionSource=glow"
-        )
-        driver.set_script_timeout(15)
-        driver.execute_async_script(script, endpoint, body)
-        time.sleep(1)
+        driver.set_script_timeout(20)
+        raw_result = driver.execute_async_script(script, endpoint, postal_code)
+        result = json.loads(raw_result or "{}")
+        if result.get("ok"):
+            driver.get(f"https://{domain}/")
+            time.sleep(2)
+            _dismiss_cookie_consent(driver)
+            time.sleep(1)
+            if _delivery_location_matches(driver, country_code):
+                return True
     except Exception:
-        return
+        pass
+
+    # Fallback: use the same controls as a human browser session. Amazon uses
+    # stable GLUX ids across its country domains, but the submit action is an
+    # input nested inside a span and a second confirmation is required on DE/UK.
+    def visible(selector: str):
+        try:
+            for node in driver.find_elements("css selector", selector):
+                if node.is_displayed() and node.is_enabled():
+                    return node
+        except Exception:
+            return None
+        return None
+
+    postal_input = visible(
+        "#GLUXZipUpdateInput, #GLUXZipUpdateInput_0, input[name='zipCode'], "
+        "input[id*='ZipUpdateInput'], input[aria-label*='postcode' i], "
+        "input[placeholder*='postcode' i], input[placeholder*='zip' i]"
+    )
+    if postal_input is None:
+        ingress = visible("#nav-global-location-popover-link") or visible("#glow-ingress-block")
+        if ingress is None:
+            raise RuntimeError(
+                f"delivery postal setup failed for {domain} ({postal_code}): location control unavailable"
+            )
+        ingress.click()
+        for _ in range(48):
+            time.sleep(0.25)
+            postal_input = visible(
+                "#GLUXZipUpdateInput, #GLUXZipUpdateInput_0, input[name='zipCode'], "
+                "input[id*='ZipUpdateInput'], input[aria-label*='postcode' i], "
+                "input[placeholder*='postcode' i], input[placeholder*='zip' i]"
+            )
+            if postal_input is not None:
+                break
+    if postal_input is None:
+        raise RuntimeError(
+            f"delivery postal setup failed for {domain} ({postal_code}): postal input unavailable"
+        )
+
+    try:
+        postal_input.clear()
+        postal_input.send_keys(postal_code)
+    except Exception:
+        filled = driver.execute_script(
+            """
+            const input = arguments[0];
+            const value = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+            setter.call(input, value);
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+            return input.value === value;
+            """,
+            postal_input,
+            postal_code,
+        )
+        if not filled:
+            raise RuntimeError(
+                f"delivery postal setup failed for {domain} ({postal_code}): postal input unavailable"
+            )
+
+    submit = visible("#GLUXZipUpdate input[type='submit'], #GLUXZipUpdate button")
+    if submit is None:
+        submit = visible(
+            "input[name='gluxZipUpdate'], button[name='gluxZipUpdate'], "
+            "input[type='submit'][value*='Update' i]"
+        )
+    if submit is None:
+        raise RuntimeError(
+            f"delivery postal setup failed for {domain} ({postal_code}): submit unavailable"
+        )
+    submit.click()
+
+    # DE shows "Bestätigen" and UK shows "Continue" after applying the code.
+    # Do not navigate away until this control has been accepted.
+    for _ in range(24):
+        time.sleep(0.25)
+        confirm = (
+            visible("#GLUXConfirmClose input, #GLUXConfirmClose button")
+            or visible("#GLUXConfirmAddress input, #GLUXConfirmAddress button")
+        )
+        if confirm is not None:
+            confirm.click()
+            break
+
+    for _ in range(30):
+        time.sleep(0.25)
+        if _delivery_location_matches(driver, country_code):
+            return True
+
+    # A refresh makes Amazon render the persisted delivery cookie in the header.
+    driver.get(f"https://{domain}/")
+    for _ in range(20):
+        time.sleep(0.25)
+        if _delivery_location_matches(driver, country_code):
+            return True
+    return False
+
+
+def _dismiss_cookie_consent(driver) -> bool:
+    """Dismiss Amazon's regional cookie wall before opening the address dialog."""
+    selectors = (
+        "#sp-cc-rejectall-link",
+        "#sp-cc-accept",
+        "input[name='accept']",
+        "button[data-action-type='DISMISS']",
+        "input[data-action-type='DISMISS']",
+    )
+    for _ in range(12):
+        for selector in selectors:
+            try:
+                node = driver.find_element("css selector", selector)
+                if not node.is_displayed() or not node.is_enabled():
+                    continue
+                try:
+                    node.click()
+                except Exception:
+                    driver.execute_script(
+                        """
+                        const node = arguments[0];
+                        node.scrollIntoView({block: 'center'});
+                        if (node.form) {
+                            if (node.form.requestSubmit) node.form.requestSubmit(node);
+                            else node.form.submit();
+                        } else {
+                            node.click();
+                        }
+                        """,
+                        node,
+                    )
+                for _ in range(12):
+                    time.sleep(0.5)
+                    try:
+                        if not node.is_displayed():
+                            return True
+                    except Exception:
+                        return True
+                return True
+            except Exception:
+                continue
+        time.sleep(0.5)
+    try:
+        return bool(driver.execute_script(
+            """
+            const selectors = [
+                '#sp-cc-rejectall-link',
+                '#sp-cc-accept',
+                'input[name="accept"]',
+                'button[data-action-type="DISMISS"]',
+                'input[data-action-type="DISMISS"]',
+                '[data-testid="拒绝"]',
+                '[data-testid="reject"]'
+            ];
+            for (const selector of selectors) {
+                const node = document.querySelector(selector);
+                if (node && node.offsetParent !== null) {
+                    if (node.form) node.form.submit(); else node.click();
+                    return true;
+                }
+            }
+            return false;
+            """
+        ))
+    except Exception:
+        return False
+
+
+def _delivery_location_matches(driver, country_code: str) -> bool:
+    """Verify the browser header reflects the configured site address."""
+    postal_code = get_postal_code(country_code)
+    try:
+        text = driver.execute_script(
+            """
+            return [
+                '#glow-ingress-line1',
+                '#glow-ingress-line2',
+                '#glow-ingress-block',
+                '#nav-global-location-data-modal-action'
+            ].map(selector => document.querySelector(selector)?.textContent || '')
+             .join(' ');
+            """
+        )
+        text = normalize_space(text) or ""
+    except Exception:
+        return False
+    # Amazon inserts spacing and invisible directional characters into some
+    # localized headers (for example "London SW1A1AA\u200c"). Postcodes are
+    # alphanumeric, so compare their canonical forms.
+    compact_text = re.sub(r"[^0-9a-z]+", "", text.casefold())
+    compact_postal = re.sub(r"[^0-9a-z]+", "", postal_code.casefold())
+    return compact_postal in compact_text
+
+
+def _item_detail_rows(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    """Return label/value pairs from Amazon's Product information details."""
+    containers = []
+    seen_containers: set[int] = set()
+
+    selectors = (
+        "#productDetails_techSpec_section_1",
+        "#productDetails_techSpec_section_2",
+        "#productDetails_detailBullets_sections1",
+        "#productDetails_detailBullets_sections2",
+        "#productDetails_db_sections",
+        "#prodDetails",
+        "#productDetails",
+        "#detailBullets_feature_div",
+        "#detailBulletsWrapper_feature_div",
+        '[data-feature-name="productDetails"]',
+        '[data-feature-name="detailBullets"]',
+    )
+    for selector in selectors:
+        for node in soup.select(selector):
+            if id(node) not in seen_containers:
+                containers.append(node)
+                seen_containers.add(id(node))
+
+    # Newer pages render Item details as an accordion instead of using the
+    # legacy productDetails_* ids. Walk up from that heading to its section.
+    heading_pattern = re.compile(
+        r"^(?:item\s+details|artikelangaben|produktdaten|product\s+information|"
+        r"informaci[oó]n\s+del\s+producto|detalles\s+del\s+producto|"
+        r"technical\s+details|additional\s+information|product\s+information)$",
+        re.I,
+    )
+    for heading in soup.find_all(string=lambda value: bool(value and heading_pattern.fullmatch(normalize_space(str(value)) or ""))):
+        current = heading.parent
+        for _ in range(8):
+            if current is None:
+                break
+            if current.find("tr") or current.find("li"):
+                if id(current) not in seen_containers:
+                    containers.append(current)
+                    seen_containers.add(id(current))
+                break
+            current = current.parent
+
+    rows: list[tuple[str, str]] = []
+    seen_rows: set[tuple[str, str]] = set()
+    for container in containers:
+        for row in container.select("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if len(cells) < 2:
+                cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = normalize_space(cells[0].get_text(" ", strip=True))
+            value = normalize_space(" ".join(cell.get_text(" ", strip=True) for cell in cells[1:]))
+            if label and value:
+                key = (label.casefold(), value)
+                if key not in seen_rows:
+                    rows.append((label, value))
+                    seen_rows.add(key)
+
+        for item in container.select("li"):
+            label_node = item.find(["span", "b", "strong"], class_=re.compile(r"a-text-bold|label", re.I))
+            label = normalize_space(label_node.get_text(" ", strip=True)) if label_node else None
+            full_value = normalize_space(item.get_text(" ", strip=True))
+            if not label or not full_value:
+                continue
+            value = normalize_space(full_value[len(label):].lstrip(" :："))
+            if value:
+                key = (label.casefold(), value)
+                if key not in seen_rows:
+                    rows.append((label, value))
+                    seen_rows.add(key)
+
+    return rows
+
+
+def detect_item_detail_status(soup: BeautifulSoup) -> str:
+    """Classify whether the fetched page exposes Product information details."""
+    selectors = (
+        "#productDetails_techSpec_section_1",
+        "#productDetails_techSpec_section_2",
+        "#productDetails_detailBullets_sections1",
+        "#productDetails_detailBullets_sections2",
+        "#productDetails_db_sections",
+        "#prodDetails",
+        "#productDetails",
+        "#detailBullets_feature_div",
+        "#detailBulletsWrapper_feature_div",
+        '[data-feature-name="productDetails"]',
+        '[data-feature-name="detailBullets"]',
+    )
+    has_container = any(soup.select_one(selector) is not None for selector in selectors)
+    heading_pattern = re.compile(
+        r"^(?:item\s+details|artikelangaben|produktdaten|product\s+information|"
+        r"informaci[oó]n\s+del\s+producto|detalles\s+del\s+producto|"
+        r"technical\s+details|additional\s+information|product\s+information)$",
+        re.I,
+    )
+    if not has_container:
+        for heading in soup.find_all(
+            string=lambda value: bool(value and heading_pattern.fullmatch(normalize_space(str(value)) or ""))
+        ):
+            current = heading.parent
+            for _ in range(8):
+                if current is None:
+                    break
+                if current.find("tr") or current.find("li"):
+                    has_container = True
+                    break
+                current = current.parent
+            if has_container:
+                break
+
+    if not has_container:
+        return DETAIL_EMPTY
+    return DETAIL_FOUND if _item_detail_rows(soup) else DETAIL_EMPTY
+
+
+def _item_detail_value(soup: BeautifulSoup, label_pattern: str) -> str | None:
+    pattern = re.compile(label_pattern, re.I)
+    for label, value in _item_detail_rows(soup):
+        if pattern.search(label):
+            return value
+    return None
 
 
 def parse_star(soup: BeautifulSoup, text: str) -> str | None:
+    customer_reviews = _item_detail_value(
+        soup,
+        r"(?:customer\s+reviews?|durchschnittliche\s+kundenbewertung|kundenbewertung|"
+        r"opini[oó]n\s+media\s+de\s+los\s+clientes|valoraci[oó]n\s+media\s+de\s+los\s+clientes)",
+    )
+    if customer_reviews:
+        match = re.search(
+            r"([0-9]+(?:[.,][0-9]+)?)\s+(?:out\s+of\s+5\s+stars|von\s+5\s+Sternen|"
+            r"de\s+5\s+estrellas|sobre\s+5\s+estrellas)",
+            customer_reviews,
+            re.I,
+        )
+        if match:
+            return match.group(1).replace(",", ".")
+
     selectors = [
         'i[data-hook="average-star-rating"] span',
         'span[data-hook="rating-out-of-text"]',
@@ -627,56 +1112,55 @@ def parse_star(soup: BeautifulSoup, text: str) -> str | None:
                 match = re.search(r"([0-9]+(?:\.[0-9]+)?)", value)
                 if match:
                     return match.group(1)
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+out of 5 stars", text, re.I)
+    match = re.search(
+        r"([0-9]+(?:[.,][0-9]+)?)\s+(?:out\s+of\s+5\s+stars|von\s+5\s+Sternen|"
+        r"de\s+5\s+estrellas|sobre\s+5\s+estrellas)",
+        text,
+        re.I,
+    )
     if match:
         return match.group(1)
     return None
 
 
 def parse_buy_box(soup: BeautifulSoup, text: str) -> int | None:
-    selectors = [
-        "#buybox",
-        "#buybox-see-all-buying-choices",
+    cart_selectors = (
         "#add-to-cart-button",
-        "#buy-now-button",
-        "#merchant-info",
-    ]
-    text_parts: list[str] = []
-    for selector in selectors:
-        node = soup.select_one(selector)
-        if node:
-            value = normalize_space(node.get_text(" ", strip=True))
-            if value:
-                text_parts.append(value)
+        "#add-to-cart-button-ubb",
+        "input[name='submit.add-to-cart']",
+        "input[name='submit.add-to-cart-ubb']",
+        "button[name='submit.add-to-cart']",
+    )
+    cart_markers = (
+        "add to cart", "add to basket", "agregar al carrito",
+        "agregar a la cesta", "in den einkaufswagen", "in den einkaufskorb",
+        "ajouter au panier",
+    )
+    for selector in cart_selectors:
+        for node in soup.select(selector):
+            value = normalize_space(node.get("value") or node.get_text(" ", strip=True)) or ""
+            if value or selector.startswith("#add-to-cart-button"):
+                return 1
 
-    candidate = " ".join(text_parts + [text]).strip()
-    lowered = candidate.lower()
-
-    if any(marker in lowered for marker in ("currently unavailable", "temporarily out of stock")):
-        return 0
-    if "see all buying options" in lowered or "see all options" in lowered:
-        return 0
-    if any(marker in lowered for marker in ("add to cart", "buy now", "add to basket")):
-        return 1
-
-    merchant = soup.select_one("#merchant-info")
-    if merchant:
-        merchant_text = normalize_space(merchant.get_text(" ", strip=True)) or ""
-        merchant_lowered = merchant_text.lower()
-        if any(
-            marker in merchant_lowered
-            for marker in (
-                "ships from and sold by amazon",
-                "fulfilled by amazon",
-                "sold by amazon",
-            )
-        ):
+    for node in soup.select("#buybox, #desktop_buybox, #buybox_feature_div, #rightCol"):
+        lowered = (normalize_space(node.get_text(" ", strip=True)) or "").casefold()
+        if any(marker in lowered for marker in cart_markers):
             return 1
 
-    if soup.select_one("#buybox") or soup.select_one("#add-to-cart-button"):
-        return 1
-
+    # Only an actual buy-box/availability container can establish a definitive
+    # no-cart state. A sparse fallback URL may omit the whole buy box; leave it
+    # unknown so a later candidate URL can still provide the real state.
+    if soup.select_one("#buybox, #desktop_buybox, #buybox_feature_div, #rightCol, #availability"):
+        return 0
     return None
+
+
+def has_product_page(soup: BeautifulSoup) -> bool:
+    """Whether this HTML is a real product detail page, not a sparse error page."""
+    return bool(
+        soup.select_one("#productTitle, #productDetails, #buybox, #rightCol, #centerCol")
+        or soup.find(attrs={"id": re.compile(r"productDetails|buybox|centerCol|rightCol", re.I)})
+    )
 
 
 def parse_price(
@@ -684,25 +1168,77 @@ def parse_price(
     raw_html: str | None = None,
     currency: str = "",
     country_code: str = "",
+    buy_box: int | None = None,
 ) -> str | None:
+    # Price is valid only when the same rendered page has a confirmed cart.
+    # Generic JSON-LD, alternate-offer and page-wide price nodes are excluded.
+    if buy_box != 1:
+        return None
+    # Current Amazon layouts may render the visible price as separate whole
+    # and fraction spans without an offscreen accessibility value.
+    split_price_containers = (
+        "#buybox",
+        "#buybox_feature_div",
+        "#corePrice_desktop",
+        "#corePrice_feature_div",
+        "[data-feature-name='corePrice']",
+        "#corePriceDisplay_desktop_feature_div",
+        "#corePriceDisplay_mobile_feature_div",
+        "#apex_desktop",
+    )
+    for container_selector in split_price_containers:
+        container = soup.select_one(container_selector)
+        if not container:
+            continue
+        whole = container.select_one(".a-price-whole")
+        fraction = container.select_one(".a-price-fraction")
+        if not whole or not fraction:
+            continue
+        whole_value = normalize_space(whole.get_text(" ", strip=True)) or ""
+        fraction_value = normalize_space(fraction.get_text(" ", strip=True)) or ""
+        whole_value = re.sub(r"[^0-9]", "", whole_value)
+        fraction_value = re.sub(r"[^0-9]", "", fraction_value)
+        if not whole_value or not fraction_value:
+            continue
+        currency_node = container.select_one(".a-price-symbol")
+        currency_value = (
+            normalize_space(currency_node.get_text(" ", strip=True))
+            if currency_node
+            else get_currency(country_code)
+        ) or ""
+        if not price_matches_site(currency_value, country_code):
+            continue
+        separator = "," if country_code.upper() in {"G", "F", "I", "S"} else "."
+        value = f"{whole_value}{separator}{fraction_value}"
+        if price_matches_site(value + currency_value, country_code):
+            return format_site_price(value, currency)
     selectors = [
+        # Current Buy Box offer only. Do not add page-wide .a-price selectors
+        # here: they also match other sellers and recommendation widgets.
+        "#corePrice_desktop .priceToPay .a-offscreen",
+        "#corePrice_feature_div .priceToPay .a-offscreen",
+        "#corePriceDisplay_desktop_feature_div .priceToPay .a-offscreen",
+        "#corePriceDisplay_mobile_feature_div .priceToPay .a-offscreen",
+        "#apex_desktop .priceToPay .a-offscreen",
+        "#buybox .priceToPay .a-offscreen",
         "#corePrice_desktop .apex-core-price-identifier .a-offscreen",
         "#corePrice_desktop .a-price .a-offscreen",
-        "#corePrice_feature_div .a-offscreen",
-        "#apex_desktop .a-offscreen",
+        "#corePrice_feature_div .a-price .a-offscreen",
+        "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+        "#corePriceDisplay_mobile_feature_div .a-price .a-offscreen",
+        "#apex_desktop .a-price .a-offscreen",
         "#buybox .a-price .a-offscreen",
         "#price_inside_buybox",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
         "#priceblock_saleprice",
-        "span.a-price span.a-offscreen",
     ]
     for selector in selectors:
         node = soup.select_one(selector)
         if node:
             value = normalize_space(node.get_text(" ", strip=True))
             if value and re.search(r"\d", value) and price_matches_site(value, country_code):
-                return value
+                return format_site_price(value, currency)
 
     if raw_html:
         decoded_html = html_lib.unescape(raw_html).replace('\\"', '"')
@@ -716,52 +1252,23 @@ def parse_price(
                 continue
             value = normalize_space(match.group(1))
             if value and price_matches_site(value, country_code):
-                return value
-
-    for script in soup.select('script[type="application/ld+json"]'):
-        raw = script.string or script.get_text()
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-
-        candidates = payload if isinstance(payload, list) else [payload]
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            offers = item.get("offers")
-            offers_list = offers if isinstance(offers, list) else [offers]
-            for offer in offers_list:
-                if not isinstance(offer, dict) or offer.get("price") in (None, ""):
-                    continue
-                price = str(offer["price"]).strip()
-                offer_currency = str(offer.get("priceCurrency") or "").strip()
-                value = f"{offer_currency} {price}" if offer_currency else price
-                if price_matches_site(value, country_code):
-                    return value
-
-    if raw_html:
-        decoded_html = html_lib.unescape(raw_html).replace('\\"', '"')
-        patterns = [
-            r'"price"\s*:\s*"([^"]*[0-9][^"]*)"',
-            r'"priceAmount"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-            r'"displayPrice"\s*:\s*"([^"]*[0-9][^"]*)"',
-        ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, decoded_html, re.I):
-                value = normalize_space(match.group(1))
-                if not value or "http" in value.lower() or len(value) > 40:
-                    continue
-                if not price_matches_site(value, country_code):
-                    continue
-                if re.fullmatch(r"[0-9]+(?:[\.,][0-9]+)?", value) and currency:
-                    return f"{currency}{value}"
-                return value
+                return format_site_price(value, currency)
 
     return None
 
 
 def parse_reviews(soup: BeautifulSoup, text: str) -> str | None:
+    customer_reviews = _item_detail_value(
+        soup,
+        r"(?:customer\s+reviews?|durchschnittliche\s+kundenbewertung|kundenbewertung|"
+        r"opini[oó]n\s+media\s+de\s+los\s+clientes|valoraci[oó]n\s+media\s+de\s+los\s+clientes)",
+    )
+    if customer_reviews:
+        # Item details normally displays the count in parentheses: (183).
+        match = re.search(r"\(([\d,.]+)\)", customer_reviews)
+        if match:
+            return match.group(1).replace(",", "").replace(".", "")
+
     selectors = [
         '#acrCustomerReviewText',
         'span[data-hook="total-review-count"]',
@@ -781,6 +1288,8 @@ def parse_reviews(soup: BeautifulSoup, text: str) -> str | None:
         r"([\d,]+)\s+ratings?",
         r"([\d,]+)\s+global ratings?",
         r"([\d,]+)\s+review(?:s)?",
+        r"([\d,.]+)\s+(?:opiniones?|valoraciones?)\s+(?:de\s+)?clientes?",
+        r"\(([\d.]+)\)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
@@ -789,7 +1298,21 @@ def parse_reviews(soup: BeautifulSoup, text: str) -> str | None:
     return None
 
 
-def parse_bsr(text: str, raw_html: str | None = None) -> str | None:
+def parse_bsr(text: str, raw_html: str | None = None, soup: BeautifulSoup | None = None) -> str | None:
+    if soup is not None:
+        item_details_bsr = _item_detail_value(
+            soup,
+            r"(?:best\s+sellers?\s+rank|bestseller[- ]rang|"
+            r"clasificaci[oó]n\s+en\s+los\s+m[aá]s\s+vendidos|"
+            r"ranking\s+de\s+los\s+m[aá]s\s+vendidos)",
+        )
+        if item_details_bsr:
+            matches = re.findall(r"(?:#|Nr\.?|n[º°o])\s*([\d,.]+)", item_details_bsr, re.I)
+            if matches:
+                # Amazon lists the broad category first and subcategories
+                # after it. The last displayed rank is the small-category BSR.
+                return matches[-1].replace(",", "").replace(".", "")
+
     if raw_html:
         decoded_html = html_lib.unescape(raw_html).replace('\\"', '"')
         for marker in ("salesRanks", "salesRank"):
@@ -813,7 +1336,12 @@ def parse_bsr(text: str, raw_html: str | None = None) -> str | None:
     lowered = normalized.lower()
     rank_labels = (
         "best sellers rank",
+        "amazon bestseller-rang",
         "bestseller-rang",
+        "clasificación en los más vendidos de amazon",
+        "clasificacion en los mas vendidos de amazon",
+        "ranking de los más vendidos",
+        "ranking de los mas vendidos",
         "clasificación de los más vendidos",
         "clasificacion de los mas vendidos",
         "rang des meilleures ventes",
@@ -900,7 +1428,99 @@ def parse_inventory(soup: BeautifulSoup, text: str) -> str | None:
     return None
 
 
+def mark_detail_unavailable(metrics: CrawlMetric, soup: BeautifulSoup) -> CrawlMetric:
+    """Mark metrics absent from a successfully loaded details section.
+
+    Amazon often omits BSR, review count, or rating for products that have no
+    such detail yet. Those omissions are terminal data, not transient fetch
+    failures. Restrict the decision to labels found inside the product-detail
+    rows so unrelated text elsewhere on the page cannot invent a value.
+    """
+    if metrics.detail_status != DETAIL_FOUND:
+        return metrics
+    labels = " ".join(label.casefold() for label, _ in _item_detail_rows(soup))
+    unavailable_fields = {
+        "star": (
+            r"customer\s+reviews?|durchschnittliche\s+kundenbewertung|kundenbewertung|"
+            r"opini[oó]n\s+media\s+de\s+los\s+clientes|valoraci[oó]n\s+media\s+de\s+los\s+clientes"
+        ),
+        "reviews": (
+            r"customer\s+reviews?|durchschnittliche\s+kundenbewertung|kundenbewertung|"
+            r"opini[oó]n\s+media\s+de\s+los\s+clientes|valoraci[oó]n\s+media\s+de\s+los\s+clientes"
+        ),
+        "bsr": (
+            r"best\s+sellers?\s+rank|bestseller[- ]rang|"
+            r"clasificaci[oó]n\s+en\s+los\s+m[aá]s\s+vendidos|"
+            r"ranking\s+de\s+los\s+m[aá]s\s+vendidos"
+        ),
+    }
+    for field_name, pattern in unavailable_fields.items():
+        # A value found outside the detail rows is not trustworthy for this
+        # decision. If the detail section has no matching label, explicitly
+        # clear it and persist the terminal "无" marker.
+        if not re.search(pattern, labels, re.I):
+            setattr(metrics, field_name, "无")
+    return metrics
+
+
+def _count_other_seller_sold_by(soup: BeautifulSoup) -> int | None:
+    marker = re.compile(
+        r"(?:other\s+sellers\s+on\s+amazon|otros\s+vendedores\s+en\s+amazon|"
+        r"andere\s+verk[aä]ufer\s+bei\s+amazon|other\s+sellers)", re.I
+    )
+    sold_marker = re.compile(r"(?:sold\s+by|vendido\s+por|verk[aä]ufer|vendu\s+par)", re.I)
+    section = None
+    for node in soup.find_all(string=marker):
+        current = node.parent
+        for _ in range(8):
+            if current is None:
+                break
+            current_text = normalize_space(current.get_text(" ", strip=True)) or ""
+            if marker.search(current_text) and sold_marker.search(current_text):
+                section = current
+                break
+            current = current.parent
+        if section is not None:
+            break
+
+    if section is None:
+        return None
+
+    # Each offer row is the authoritative seller entry. Exclude the pinned
+    # Buy Box offer, which may also contain a Sold by label.
+    offer_nodes = []
+    for selector in ("#aod-offer-list .aod-offer", ".aod-offer", "#olpOfferList .olpOffer"):
+        offer_nodes.extend(section.select(selector))
+    unique_offers = []
+    seen_offer_ids: set[int] = set()
+    for offer in offer_nodes:
+        if id(offer) not in seen_offer_ids:
+            unique_offers.append(offer)
+            seen_offer_ids.add(id(offer))
+    sold_offers = [
+        offer for offer in unique_offers
+        if sold_marker.search(normalize_space(offer.get_text(" ", strip=True)) or "")
+    ]
+    if sold_offers:
+        return len(sold_offers)
+
+    # Some Amazon variants do not wrap offers in .aod-offer. Count visible
+    # Sold by text nodes in the Other sellers section as a structural fallback.
+    sold_by_nodes = section.find_all(string=sold_marker)
+    if sold_by_nodes:
+        return len(sold_by_nodes)
+    return 0
+
+
 def parse_follow_sale(soup: BeautifulSoup, text: str, raw_html: str | None = None) -> str | None:
+    other_seller_count = _count_other_seller_sold_by(soup)
+    if other_seller_count is not None:
+        return str(other_seller_count)
+    # Seller counts are valid only when the Other sellers section contains
+    # identifiable Sold by/Vendido por/Verkäufer rows. Do not infer counts
+    # from prices, offer summaries, or arbitrary page numbers.
+    return None
+
     selectors = [
         "#olpLinkWidget_feature_div",
         "#olpLinkWidget",
@@ -958,18 +1578,35 @@ def parse_follow_sale(soup: BeautifulSoup, text: str, raw_html: str | None = Non
     return None
 
 
-def extract_metrics(html: str, country_code: str = "") -> CrawlMetric:
+def extract_metrics(
+    html: str,
+    country_code: str = "",
+    offer_allowed: bool = False,
+) -> CrawlMetric:
+    if not html or not html.strip():
+        return CrawlMetric(detail_status=DETAIL_UNKNOWN)
     soup = BeautifulSoup(html, "html.parser")
     text = normalize_space(soup.get_text(" ", strip=True)) or ""
-    return CrawlMetric(
-        buy_box=parse_buy_box(soup, text),
-        price=parse_price(soup, html, get_currency(country_code), country_code),
+    offer_verified = offer_allowed and has_product_page(soup)
+    buy_box = parse_buy_box(soup, text) if offer_verified else None
+    metrics = CrawlMetric(
+        buy_box=buy_box,
+        price=parse_price(
+            soup,
+            html,
+            get_currency(country_code),
+            country_code,
+            buy_box=buy_box,
+        ),
         star=parse_star(soup, text),
         reviews=parse_reviews(soup, text),
-        bsr=parse_bsr(text, html),
+        bsr=parse_bsr(text, html, soup),
         inventory=parse_inventory(soup, text),
         follow_sale=parse_follow_sale(soup, text, html),
+        detail_status=detect_item_detail_status(soup),
+        offer_verified=offer_verified,
     )
+    return mark_detail_unavailable(metrics, soup)
 
 
 def crawl_item_metrics(
@@ -992,13 +1629,104 @@ def crawl_item_metrics(
         selenium_driver is not None
         and os.getenv("AMAZON_SELENIUM_ONLY", "").lower() in {"1", "true", "yes"}
     )
+
+    # Prefer a real browser for every product.  Amazon frequently serves a
+    # captcha or a reduced page to requests/curl while the same URL is fully
+    # available in a normal browser session.  Try all browser URL variants
+    # first; only then use lightweight clients as fallbacks.
+    enable_selenium = (
+        selenium_driver is not None
+        and os.getenv("AMAZON_ENABLE_SELENIUM", "").lower() in {"1", "true", "yes"}
+    )
+    if enable_selenium:
+        expected_postal = get_postal_code(country_code)
+        attached_browser = bool(getattr(selenium_driver, "_codex_attached", False))
+        location_ready = bool(
+            selenium_location_state is not None
+            and selenium_location_state.get("country") == country_code
+            and selenium_location_state.get("postal_code") == expected_postal
+            and _delivery_location_matches(selenium_driver, country_code)
+        )
+        if not location_ready and attached_browser:
+            # A manually configured browser may already show the requested
+            # postcode. Reuse that verified state instead of reopening the
+            # location dialog and disturbing the user's session.
+            location_ready = _delivery_location_matches(selenium_driver, country_code)
+            if location_ready and selenium_location_state is not None:
+                selenium_location_state["country"] = country_code
+                selenium_location_state["postal_code"] = expected_postal
+        if not location_ready:
+            try:
+                location_ready = set_delivery_location_selenium(
+                    selenium_driver,
+                    country_code,
+                    locale,
+                )
+                if not location_ready:
+                    raise RuntimeError(
+                        f"delivery postal verification failed for "
+                        f"{get_site_domain(country_code)} ({expected_postal})"
+                    )
+                if selenium_location_state is not None:
+                    selenium_location_state["country"] = country_code
+                    selenium_location_state["postal_code"] = expected_postal
+            except Exception as exc:
+                location_ready = False
+                if selenium_location_state is not None:
+                    selenium_location_state.clear()
+                attempts.append(
+                    CrawlAttempt(
+                        method="selenium:delivery-location",
+                        url=f"https://{get_site_domain(country_code)}/",
+                        success=False,
+                        message=str(exc),
+                    )
+                )
+        if location_ready:
+            selenium_urls = candidate_urls
+            if os.getenv("AMAZON_SELENIUM_FAST", "").lower() in {"1", "true", "yes"}:
+                selenium_urls = candidate_urls[:1]
+            for url_name, url in selenium_urls:
+                if result.is_complete():
+                    break
+                try:
+                    html = fetch_selenium_html(
+                        url,
+                        locale,
+                        driver=selenium_driver,
+                        country_code=country_code,
+                        require_location=True,
+                    )
+                    parsed = extract_metrics(html, country_code, offer_allowed=True)
+                    result.merge(parsed)
+                    attempts.append(
+                        CrawlAttempt(
+                            method=f"selenium:{url_name}",
+                            url=url,
+                            success=True,
+                            message=f"filled={_filled_fields(parsed)}",
+                        )
+                    )
+                except Exception as exc:
+                    attempts.append(
+                        CrawlAttempt(
+                            method=f"selenium:{url_name}",
+                            url=url,
+                            success=False,
+                            message=str(exc),
+                        )
+                    )
+
     if not selenium_only:
         for url_name, url in candidate_urls:
             if result.is_complete():
                 break
             try:
                 html = fetch_requests_html(session, url, locale)
-                parsed = extract_metrics(html, country_code)
+                # Lightweight clients cannot reliably prove that Amazon kept
+                # the requested delivery postcode. Use them for non-offer
+                # metrics only; cart and price require browser verification.
+                parsed = extract_metrics(html, country_code, offer_allowed=False)
                 result.merge(parsed)
                 attempts.append(
                     CrawlAttempt(
@@ -1024,7 +1752,7 @@ def crawl_item_metrics(
                 break
             try:
                 html = fetch_curl_html(url, locale)
-                parsed = extract_metrics(html, country_code)
+                parsed = extract_metrics(html, country_code, offer_allowed=False)
                 result.merge(parsed)
                 attempts.append(
                     CrawlAttempt(
@@ -1044,43 +1772,13 @@ def crawl_item_metrics(
                     )
                 )
 
-    enable_selenium = os.getenv("AMAZON_ENABLE_SELENIUM", "").lower() in {"1", "true", "yes"}
-    if not result.is_complete() and enable_selenium:
-        if selenium_driver is not None and (
-            selenium_location_state is None
-            or selenium_location_state.get("country") != country_code
-        ):
-            set_delivery_location_selenium(selenium_driver, country_code, locale)
-            if selenium_location_state is not None:
-                selenium_location_state["country"] = country_code
-        selenium_urls = candidate_urls
-        if os.getenv("AMAZON_SELENIUM_FAST", "").lower() in {"1", "true", "yes"}:
-            selenium_urls = candidate_urls[:1]
-        for url_name, url in selenium_urls:
-            try:
-                html = fetch_selenium_html(url, locale, driver=selenium_driver)
-                parsed = extract_metrics(html, country_code)
-                result.merge(parsed)
-                attempts.append(
-                    CrawlAttempt(
-                        method=f"selenium:{url_name}",
-                        url=url,
-                        success=True,
-                        message=f"filled={_filled_fields(parsed)}",
-                    )
-                )
-                if result.is_complete():
-                    break
-            except Exception as exc:
-                attempts.append(
-                    CrawlAttempt(
-                        method=f"selenium:{url_name}",
-                        url=url,
-                        success=False,
-                        message=str(exc),
-                    )
-                )
-
+    # Amazon may omit the cart control when the offer is unavailable. Treat
+    # that state as an explicit no-cart result instead of exposing an unknown
+    # value to the daily data view.
+    if result.offer_verified and result.buy_box is None:
+        result.buy_box = 0
+    if result.buy_box != 1:
+        result.price = None
     return result, attempts
 
 
@@ -1103,7 +1801,7 @@ def fetch_targets(
         "SELECT id, asin, country, asin_country, name",
         f"FROM {quote_identifier('amazon_data')}",
     ]
-    where_parts: list[str] = []
+    where_parts: list[str] = ["status = 1"]
     params: list[Any] = []
 
     if data_id is not None:
@@ -1116,9 +1814,6 @@ def fetch_targets(
     if asin_country:
         where_parts.append("asin_country = %s")
         params.append(asin_country)
-    if data_id is None and not data_ids and not asin_country:
-        where_parts.append("status = 1")
-
     if where_parts:
         sql.append("WHERE " + " AND ".join(where_parts))
 
@@ -1146,6 +1841,30 @@ def fetch_existing_day_id(connection, data_id: int, count_day: date) -> int | No
     return None
 
 
+def ensure_re_pull_column(connection) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'asin_day_data'
+              AND COLUMN_NAME = 're_pull'
+            """
+        )
+        if int(cursor.fetchone()["total"]) == 0:
+            cursor.execute(
+                "ALTER TABLE `asin_day_data` ADD COLUMN `re_pull` TINYINT NOT NULL DEFAULT 0"
+            )
+            connection.commit()
+
+
+def metric_needs_repull(metrics: CrawlMetric) -> bool:
+    if all(getattr(metrics, field_name) == "无" for field_name in ("star", "reviews", "bsr")):
+        return False
+    return not metrics.is_complete() and metrics.detail_status != DETAIL_EMPTY
+
+
 def upsert_day_record(
     connection,
     data_id: int,
@@ -1154,6 +1873,7 @@ def upsert_day_record(
     metrics: CrawlMetric,
     count_day: date,
     fill_missing_only: bool = False,
+    finalize_repull: bool = False,
 ) -> str:
     existing_id = fetch_existing_day_id(connection, data_id, count_day)
     values = {
@@ -1167,6 +1887,7 @@ def upsert_day_record(
         "bsr": metrics.bsr,
         "inventory": metrics.inventory,
         "follow_sale": metrics.follow_sale,
+        "re_pull": 0 if finalize_repull or not metric_needs_repull(metrics) else 1,
         "count_day": count_day,
     }
 
@@ -1179,12 +1900,32 @@ def upsert_day_record(
                     (existing_id,),
                 )
                 existing_values = cursor.fetchone() or {}
-        updates = {
-            column: value
-            for column, value in values.items()
-            if column not in {"data_id", "count_day"} and value is not None
-            and (not fill_missing_only or existing_values.get(column) in (None, ""))
-        }
+        updates = {}
+        for column, value in values.items():
+            if column in {"data_id", "count_day"}:
+                continue
+
+            # A full pull always replaces the day's price, including with NULL
+            # when no verified cart price was found. During compensation, only
+            # clear a stale price when the stored row is already no-cart.
+            clear_unverified_price = (
+                column == "price"
+                and value is None
+                and metrics.offer_verified
+                and (
+                    not fill_missing_only
+                    or str(existing_values.get("buy_box") or "0").strip() != "1"
+                )
+            )
+            if value is None and not clear_unverified_price:
+                continue
+            if (
+                clear_unverified_price
+                or column == "re_pull"
+                or not fill_missing_only
+                or existing_values.get(column) in (None, "")
+            ):
+                updates[column] = value
         if not updates:
             return "unchanged"
 
@@ -1199,7 +1940,7 @@ def upsert_day_record(
     insert_values = {column: value for column, value in values.items() if value is not None}
     if not any(
         insert_values.get(column) is not None
-        for column in ("buy_box", "price", "star", "reviews", "bsr", "inventory")
+        for column in ("buy_box", "price", "star", "reviews", "bsr", "inventory", "re_pull")
     ):
         return "skipped"
 
@@ -1219,7 +1960,9 @@ def crawl_amazon_day_data(
     asin_country: str | None = None,
     limit: int | None = None,
     fill_missing_only: bool = False,
+    finalize_repull: bool = False,
 ) -> dict[str, Any]:
+    ensure_re_pull_column(connection)
     targets = fetch_targets(connection, data_id=data_id, data_ids=data_ids, asin_country=asin_country, limit=limit)
     today = date.today()
     items: list[dict[str, Any]] = []
@@ -1256,23 +1999,21 @@ def crawl_amazon_day_data(
                     )
                     record.metrics = metrics
                     record.attempts = attempts
-                    if metrics.has_any_value():
-                        action = upsert_day_record(
-                            connection,
-                            record.data_id,
-                            record.asin_country,
-                            record.name,
-                            metrics,
-                            today,
-                            fill_missing_only=fill_missing_only,
-                        )
-                        record.db_action = action
-                        if action in stats:
-                            stats[action] += 1
-                    else:
-                        record.db_action = "skipped"
+                    action = upsert_day_record(
+                        connection,
+                        record.data_id,
+                        record.asin_country,
+                        record.name,
+                        metrics,
+                        today,
+                        fill_missing_only=fill_missing_only,
+                        finalize_repull=finalize_repull,
+                    )
+                    record.db_action = action
+                    if action in stats:
+                        stats[action] += 1
+                    if not metrics.has_any_value() and metrics.detail_status == DETAIL_UNKNOWN:
                         record.error = "no metrics captured"
-                        stats["skipped"] += 1
                 except Exception as exc:
                     record.db_action = "failed"
                     record.error = str(exc)

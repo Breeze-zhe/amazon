@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import pymysql
 from .amazon_sites import build_product_link
 
 
-DEFAULT_EXCEL_PATH = r"D:\维护链接\链接信息.xlsx"
+DEFAULT_EXCEL_PATH = r"C:\Users\Administrator\Desktop\运营链接-模板（全）.xlsx"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3306
 DEFAULT_USER = "root"
@@ -28,6 +29,7 @@ EXPLICIT_HEADER_TO_COLUMN = {
     "销售建议": "remark",
     "国家": "country_name",
     "产品": "name",
+    "运营": "operation",
     "小组": "group",
     "接手月份": "select_date",
     "ASIN+国家": "asin_country",
@@ -79,6 +81,8 @@ class ImportStats:
     inserted_rows: int = 0
     matched_existing: int = 0
     updated_existing_rows: int = 0
+    obsoleted_rows: int = 0
+    reactivated_rows: int = 0
     skipped_duplicate_in_file: int = 0
     skipped_missing_key: int = 0
 
@@ -300,34 +304,25 @@ def collect_candidate_rows(
     return rows, stats
 
 
-def fetch_existing_rows(connection, table: str, rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
-    if not rows:
-        return {}
-
+def fetch_existing_rows(connection, table: str) -> dict[tuple[str, str], dict[str, Any]]:
     existing: dict[tuple[str, str], dict[str, Any]] = {}
-    select_sql = f"SELECT * FROM {quote_identifier(table)} WHERE asin = %s AND country = %s LIMIT 1"
-
     with connection.cursor() as cursor:
-        for row in rows:
-            asin = str(row["asin"])
-            country = str(row["country"])
-            cursor.execute(select_sql, (asin, country))
-            existing_row = cursor.fetchone()
-            if existing_row:
-                existing[(asin, country)] = existing_row
+        cursor.execute(f"SELECT * FROM {quote_identifier(table)}")
+        for row in cursor.fetchall():
+            key = (str(row.get("asin") or "").strip(), str(row.get("country") or "").strip())
+            if key not in existing:
+                existing[key] = row
 
     return existing
 
 
-def update_imported_fields(
-    connection,
-    table: str,
+def build_existing_updates(
     candidate_row: dict[str, Any],
     existing_row: dict[str, Any],
-) -> int:
+) -> tuple[dict[str, Any], bool, bool]:
     updates: dict[str, Any] = {}
     for column, value in candidate_row.items():
-        if column in KEY_COLUMNS or column in {"id", "status"}:
+        if column in KEY_COLUMNS or column in {"id", "status", "obsolete_date"}:
             continue
         if value is None or value == "":
             continue
@@ -335,6 +330,41 @@ def update_imported_fields(
         if str(current_value or "") != str(value):
             updates[column] = value
 
+    imported_fields_changed = bool(updates)
+    status_value = str(
+        existing_row.get("status") if existing_row.get("status") is not None else ""
+    ).strip()
+    reactivated = status_value == "0"
+    if status_value != "1":
+        updates["status"] = DEFAULT_STATUS
+    if existing_row.get("obsolete_date") not in (None, ""):
+        updates["obsolete_date"] = None
+    return updates, imported_fields_changed, reactivated
+
+
+def build_obsolete_updates(
+    existing_row: dict[str, Any],
+    obsolete_day: date,
+) -> tuple[dict[str, Any], bool]:
+    status_value = str(
+        existing_row.get("status") if existing_row.get("status") is not None else ""
+    ).strip()
+    newly_obsoleted = status_value != "0"
+    updates: dict[str, Any] = {}
+    if newly_obsoleted:
+        updates["status"] = 0
+        updates["obsolete_date"] = obsolete_day
+    elif existing_row.get("obsolete_date") in (None, ""):
+        updates["obsolete_date"] = obsolete_day
+    return updates, newly_obsoleted
+
+
+def update_row_by_key(
+    connection,
+    table: str,
+    key: tuple[str, str],
+    updates: dict[str, Any],
+) -> int:
     if not updates:
         return 0
 
@@ -344,7 +374,7 @@ def update_imported_fields(
         f"SET {set_sql} "
         "WHERE asin = %s AND country = %s"
     )
-    params = list(updates.values()) + [candidate_row["asin"], candidate_row["country"]]
+    params = [*updates.values(), *key]
 
     with connection.cursor() as cursor:
         cursor.execute(sql, params)
@@ -356,15 +386,36 @@ def update_existing_imported_fields(
     table: str,
     rows: list[dict[str, Any]],
     existing_rows: dict[tuple[str, str], dict[str, Any]],
-) -> int:
+) -> tuple[int, int]:
     updated = 0
+    reactivated = 0
     for row in rows:
         key = (str(row["asin"]), str(row["country"]))
         existing_row = existing_rows.get(key)
-        if existing_row and update_imported_fields(connection, table, row, existing_row):
-            updated += 1
-    connection.commit()
-    return updated
+        if not existing_row:
+            continue
+        updates, imported_fields_changed, row_reactivated = build_existing_updates(row, existing_row)
+        update_row_by_key(connection, table, key, updates)
+        updated += int(imported_fields_changed)
+        reactivated += int(row_reactivated)
+    return updated, reactivated
+
+
+def mark_obsolete_rows(
+    connection,
+    table: str,
+    source_keys: set[tuple[str, str]],
+    existing_rows: dict[tuple[str, str], dict[str, Any]],
+    obsolete_day: date,
+) -> int:
+    obsoleted = 0
+    for key, existing_row in existing_rows.items():
+        if key in source_keys:
+            continue
+        updates, newly_obsoleted = build_obsolete_updates(existing_row, obsolete_day)
+        update_row_by_key(connection, table, key, updates)
+        obsoleted += int(newly_obsoleted)
+    return obsoleted
 
 
 def insert_rows(connection, table: str, rows: list[dict[str, Any]], batch_size: int) -> int:
@@ -384,7 +435,6 @@ def insert_rows(connection, table: str, rows: list[dict[str, Any]], batch_size: 
             cursor.executemany(sql, values)
             inserted += cursor.rowcount
 
-    connection.commit()
     return inserted
 
 
@@ -401,30 +451,76 @@ def import_excel_data(
     db_columns = insertable_columns(columns)
     mapping, unmapped_headers = build_column_mapping(list(df.columns), db_columns)
 
-    missing_required = [column for column in ("asin", "country") if column not in db_columns]
+    missing_required = [
+        column
+        for column in ("asin", "country", "status", "obsolete_date")
+        if column not in db_columns
+    ]
     if missing_required:
         raise RuntimeError(f"Target table is missing required columns: {', '.join(missing_required)}")
 
+    header_index = build_excel_header_index(list(df.columns))
+    missing_source_headers = []
+    if "asin" not in mapping:
+        missing_source_headers.append("ASIN")
+    if normalize_name(COUNTRY_SOURCE_HEADER) not in header_index:
+        missing_source_headers.append(COUNTRY_SOURCE_HEADER)
+    if missing_source_headers:
+        raise RuntimeError(
+            f"Source Excel is missing required headers: {', '.join(missing_source_headers)}"
+        )
+
     rows, stats = collect_candidate_rows(df, mapping, db_columns)
-    existing_rows = fetch_existing_rows(connection, table, rows)
+    if not rows:
+        raise RuntimeError("Source Excel contains no valid ASIN + country links; database was not changed")
+
+    existing_rows = fetch_existing_rows(connection, table)
     insert_candidates = [
         row
         for row in rows
         if (str(row["asin"]), str(row["country"])) not in existing_rows
     ]
     stats.matched_existing = len(rows) - len(insert_candidates)
+    source_keys = {(str(row["asin"]), str(row["country"])) for row in rows}
+    sync_day = date.today()
+
+    for row in rows:
+        existing_row = existing_rows.get((str(row["asin"]), str(row["country"])))
+        if not existing_row:
+            continue
+        _, imported_fields_changed, reactivated = build_existing_updates(row, existing_row)
+        stats.updated_existing_rows += int(imported_fields_changed)
+        stats.reactivated_rows += int(reactivated)
+    for key, existing_row in existing_rows.items():
+        if key not in source_keys:
+            _, newly_obsoleted = build_obsolete_updates(existing_row, sync_day)
+            stats.obsoleted_rows += int(newly_obsoleted)
 
     if dry_run:
         stats.inserted_rows = len(insert_candidates)
-        stats.updated_existing_rows = stats.matched_existing
         connection.rollback()
         return stats, unmapped_headers
 
-    stats.updated_existing_rows = update_existing_imported_fields(
-        connection,
-        table,
-        rows,
-        existing_rows,
-    )
-    stats.inserted_rows = insert_rows(connection, table, insert_candidates, batch_size)
-    return stats, unmapped_headers
+    try:
+        updated, reactivated = update_existing_imported_fields(
+            connection,
+            table,
+            rows,
+            existing_rows,
+        )
+        obsoleted = mark_obsolete_rows(
+            connection,
+            table,
+            source_keys,
+            existing_rows,
+            sync_day,
+        )
+        stats.updated_existing_rows = updated
+        stats.reactivated_rows = reactivated
+        stats.obsoleted_rows = obsoleted
+        stats.inserted_rows = insert_rows(connection, table, insert_candidates, batch_size)
+        connection.commit()
+        return stats, unmapped_headers
+    except Exception:
+        connection.rollback()
+        raise

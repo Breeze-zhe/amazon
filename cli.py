@@ -40,6 +40,8 @@ def print_summary(stats, unmapped_headers: list[str], dry_run: bool) -> None:
     print(f"  {action}: {stats.inserted_rows}")
     print(f"  matched existing asin+country: {stats.matched_existing}")
     print(f"  {update_action}: {stats.updated_existing_rows}")
+    print(f"  obsoleted rows: {stats.obsoleted_rows}")
+    print(f"  reactivated rows: {stats.reactivated_rows}")
     print(f"  skipped duplicate in file: {stats.skipped_duplicate_in_file}")
     print(f"  skipped missing asin/country: {stats.skipped_missing_key}")
     print(f"  unmapped Excel headers: {len(unmapped_headers)}")
