@@ -11,6 +11,7 @@ SITE_DOMAIN_MAP = {
     "I": "www.amazon.it",
     "S": "www.amazon.es",
     "A": "www.amazon.com.au",
+    "J": "www.amazon.co.jp",
 }
 
 

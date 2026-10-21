@@ -21,7 +21,7 @@ DEFAULT_DATABASE = "amazon"
 DEFAULT_TABLE = "amazon_data"
 
 COUNTRY_SOURCE_HEADER = "简称"
-LABEL_VALUES = {"新品链接", "动销活动", "清仓", "链接异常"}
+LABEL_VALUES = {"新品链接", "动销活动", "清仓", "链接异常", "链接挂了"}
 
 EXPLICIT_HEADER_TO_COLUMN = {
     "ASIN": "asin",
