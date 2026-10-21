@@ -1,0 +1,7 @@
+pandas>=2.0
+openpyxl>=3.1
+PyMySQL>=1.1
+Flask>=3.0
+requests>=2.31
+beautifulsoup4>=4.12
+selenium>=4.20

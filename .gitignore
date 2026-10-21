@@ -1,0 +1,36 @@
+# Local tooling, browser profiles, cookies, drivers, and crawl state.
+/.*
+!/.gitignore
+!/.gitattributes
+!/.env.example
+!/.verify_day_metric_busy_ui.py
+
+# Python environment and generated files.
+__pycache__/
+*.py[cod]
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Runtime logs, exports, and databases.
+*.log
+*.jsonl
+*.lock
+*.sqlite
+*.sqlite3
+*.db
+*.xlsx
+*.xls
+*.csv
+*.sql

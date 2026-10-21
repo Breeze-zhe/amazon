@@ -1,0 +1,850 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Amazon 数据中心</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=20261019_1">
+</head>
+<body>
+    <div id="app" class="app-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark">A</div>
+                <div>
+                    <strong>Amazon 数据中心</strong>
+                    <span>运营数据管理</span>
+                </div>
+            </div>
+
+            <nav class="menu" aria-label="主菜单">
+                <button
+                    v-for="(item, itemIndex) in menuItems"
+                    :key="fieldKey(item) || itemIndex"
+                    class="menu-item"
+                    :class="{ active: activeView === fieldKey(item) }"
+                    type="button"
+                    @click="selectMenu(item)"
+                >
+                    <span class="menu-icon" aria-hidden="true">[[ item && item.icon ? item.icon : "" ]]</span>
+                    <span>[[ fieldLabel(item) ]]</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <span class="status-dot"></span>
+                <span>数据库已连接</span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <section v-if="activeView === 'data-overview'" class="overview-page">
+                <header class="overview-header">
+                    <div>
+                        <h1>数据概览</h1>
+                        <p>[[ overviewDate ]] 运营数据<span v-if="overviewStockDate"> / 库存 [[ overviewStockDate ]]</span></p>
+                    </div>
+                    <button
+                        class="overview-refresh"
+                        type="button"
+                        title="刷新数据概览"
+                        aria-label="刷新数据概览"
+                        :disabled="overviewLoading"
+                        @click="loadOverview"
+                    >↻</button>
+                </header>
+
+                <div v-if="overviewErrorMessage" class="overview-error">[[ overviewErrorMessage ]]</div>
+
+                <section
+                    v-for="section in overviewSections"
+                    :key="section.key"
+                    class="overview-section"
+                    :class="`overview-section-${section.key}`"
+                >
+                    <div class="overview-section-heading">
+                        <h2>[[ section.label ]]</h2>
+                    </div>
+                    <div class="overview-grid">
+                        <button
+                            v-for="card in section.cards"
+                            :key="card.key"
+                            class="overview-card"
+                            type="button"
+                            :disabled="overviewLoading"
+                            @click="openOverviewMetric(card)"
+                        >
+                            <span class="overview-card-copy">
+                                <span class="overview-card-label">[[ card.label ]]</span>
+                                <strong>[[ overviewLoading && !overviewLoaded ? '—' : overviewValue(card) ]]</strong>
+                                <small>[[ card.hint ]]</small>
+                            </span>
+                            <span class="overview-card-arrow" aria-hidden="true">›</span>
+                        </button>
+                    </div>
+                </section>
+            </section>
+
+            <section v-else-if="activeView === 'basic-info'" class="content-panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>商品基本信息</h2>
+                        <p>查看 Amazon 商品、国家站点和运营归属信息</p>
+                    </div>
+                    <div class="record-count">共 [[ total ]] 条</div>
+                </div>
+
+                <div class="metric-board basic-metric-board">
+                    <button
+                        v-for="(card, cardIndex) in basicMetricCards"
+                        :key="fieldKey(card) || cardIndex"
+                        class="metric-card"
+                        :class="{ active: basicMetric === fieldKey(card) }"
+                        type="button"
+                        :disabled="loading"
+                        @click="setBasicMetric(fieldKey(card))"
+                    >
+                        <span>[[ fieldLabel(card) ]]</span>
+                        <strong>[[ basicSummaryValue(card) ]]</strong>
+                        <small>[[ card.hint ]]</small>
+                    </button>
+                    <button
+                        v-if="basicMetric"
+                        class="metric-clear"
+                        type="button"
+                        :disabled="loading"
+                        @click="clearBasicMetric"
+                    >清除看板筛选</button>
+                </div>
+
+                <div class="toolbar">
+                    <label class="search-box">
+                        <span class="search-icon" aria-hidden="true">⌕</span>
+                        <input
+                            v-model.trim="search"
+                            type="search"
+                            placeholder="搜索产品、ASIN、国家、小组..."
+                            autocomplete="off"
+                            @input="scheduleSearch"
+                        >
+                    </label>
+                    <label class="operation-filter">
+                        <span>运营</span>
+                        <select v-model="basicOperation" :disabled="loading" @change="setBasicOperation(basicOperation)">
+                            <option value="">全部运营</option>
+                            <option v-for="operation in operationOptions" :key="operation" :value="operation">[[ operation ]]</option>
+                        </select>
+                    </label>
+                    <button class="clear-button" type="button" @click="clearSearch">清除筛选</button>
+                    <button
+                        class="refresh-button"
+                        type="button"
+                        title="刷新连接信息"
+                        :disabled="loading || syncing"
+                        @click="syncConnectionInfo"
+                    >
+                        <span aria-hidden="true">↻</span>
+                        <span>[[ syncing ? '同步中...' : '刷新连接信息' ]]</span>
+                    </button>
+                </div>
+
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th v-for="(column, columnIndex) in columns" :key="fieldKey(column) || columnIndex">[[ fieldLabel(column) ]]</th>
+                                <th class="actions-column">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="loading">
+                                <td class="table-message" :colspan="columns.length + 1">正在加载数据...</td>
+                            </tr>
+                            <tr v-else-if="errorMessage">
+                                <td class="table-message error-message" :colspan="columns.length + 1">[[ errorMessage ]]</td>
+                            </tr>
+                            <tr v-else-if="rows.length === 0">
+                                <td class="table-message" :colspan="columns.length + 1">没有找到匹配的数据</td>
+                            </tr>
+                            <template v-else>
+                            <tr v-for="row in rows" :key="row.id">
+                                <td v-for="(column, columnIndex) in columns" :key="fieldKey(column) || columnIndex">
+                                    <span v-if="isField(column, 'status')" class="status-badge" :class="statusClass(row.status)">
+                                        [[ formatStatus(row.status) ]]
+                                    </span>
+                                    <a
+                                        v-else-if="isField(column, 'link') && row.link"
+                                        class="product-link"
+                                        :href="row.link"
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        title="打开 Amazon 商品链接"
+                                    >[[ row.link ]]</a>
+                                    <span
+                                        v-else-if="isField(column, 'label')"
+                                        class="label-badge"
+                                        :class="labelClass(row.label)"
+                                    >[[ formatLabel(row.label) ]]</span>
+                                    <span v-else-if="isField(column, 'picture')" class="picture-cell">
+                                        <a
+                                            v-if="row.picture"
+                                            class="picture-link"
+                                            :href="row.picture"
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            title="打开原图"
+                                        >
+                                            <img
+                                                class="picture-thumbnail"
+                                                :src="row.picture"
+                                                :alt="`${row.name || '商品'}图片`"
+                                                @error="handlePictureError"
+                                            >
+                                            <span class="picture-fallback" hidden>图片加载失败</span>
+                                        </a>
+                                        <span v-else class="picture-empty">暂无图片</span>
+                                    </span>
+                                    <a v-else-if="isField(column, 'link') && row.link" class="product-link" :href="row.link" target="_blank" rel="noopener noreferrer">[[ row.link ]]</a>
+                                    <span v-else-if="isField(column, 'link')" class="empty-cell">暂无</span>
+                                    <span v-else-if="isField(column, 'picture')" class="picture-cell">
+                                        <a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer">
+                                            <img class="picture-thumbnail" :src="row.picture" :alt="`${row.name || '商品'}图片`" @error="handlePictureError">
+                                            <span class="picture-fallback" hidden>图片加载失败</span>
+                                        </a>
+                                        <span v-else class="picture-empty">暂无图片</span>
+                                    </span>
+                                    <span v-else>[[ displayValue(rawFieldValue(row, column)) ]]</span>
+                                </td>
+                                <td class="actions-column">
+                                    <div class="row-actions">
+                                        <button class="row-action" type="button" @click="openDetail(row, basicDetailColumns)">查看详情</button>
+                                        <button class="row-action primary" type="button" @click="openEdit(row)">编辑</button>
+                                        <button class="row-action" type="button" @click="showComingSoon('广告活动', row)">广告活动</button>
+                                        <button class="row-action" type="button" @click="openStockDetail(row)">库存</button>
+                                    </div>
+                                </td>
+                            </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="table-footer">
+                    <span>第 [[ page ]] / [[ totalPages ]] 页</span>
+                    <label class="page-size-control">每页
+                        <select v-model.number="pageSize" :disabled="loading" @change="changePageSize">
+                            <option :value="50">50</option>
+                            <option :value="100">100</option>
+                            <option :value="200">200</option>
+                        </select>
+                    </label>
+                    <div class="pagination">
+                        <button type="button" title="上一页" :disabled="page <= 1 || loading" @click="changePage(page - 1)">‹</button>
+                        <button type="button" title="下一页" :disabled="page >= totalPages || loading" @click="changePage(page + 1)">›</button>
+                    </div>
+                </div>
+            </section>
+
+            <section v-else-if="activeView === 'day-data'" class="content-panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>日数据跟进</h2>
+                        <p>按日期查看 BSR、价格、星级、评论数、库存和 Buy Box 数据</p>
+                    </div>
+                    <div class="record-count">共 [[ dayTotal ]] 条</div>
+                </div>
+
+                <div class="metric-board day-metric-board">
+                    <button
+                        v-for="(card, cardIndex) in dayMetricCards"
+                        :key="fieldKey(card) || cardIndex"
+                        class="metric-card"
+                        :class="{ active: dayMetric === card.metric }"
+                        type="button"
+                        :disabled="dayLoading"
+                        @click="setDayMetric(card.metric)"
+                    >
+                        <span>[[ fieldLabel(card) ]]</span>
+                        <strong>[[ daySummary[fieldKey(card)] || 0 ]]</strong>
+                        <small>[[ card.hint ]]</small>
+                    </button>
+                    <button
+                        v-if="dayMetric !== 'all'"
+                        class="metric-clear"
+                        type="button"
+                        :disabled="dayLoading"
+                        @click="clearDayMetric"
+                    >清除看板筛选</button>
+                </div>
+
+                <div class="toolbar">
+                    <label class="date-filter">
+                        <span>日期</span>
+                        <input
+                            v-model="dayDate"
+                            type="date"
+                            @change="changeDayDate"
+                        >
+                    </label>
+                    <label class="search-box">
+                        <span class="search-icon" aria-hidden="true">⌕</span>
+                        <input
+                            v-model.trim="daySearch"
+                            type="search"
+                            placeholder="搜索产品、ASIN、国家或标签..."
+                            autocomplete="off"
+                            @input="scheduleDaySearch"
+                        >
+                    </label>
+                    <label class="operation-filter">
+                        <span>运营</span>
+                        <select v-model="dayOperation" :disabled="dayLoading" @change="setDayOperation(dayOperation)">
+                            <option value="">全部运营</option>
+                            <option v-for="operation in operationOptions" :key="`day-${operation}`" :value="operation">[[ operation ]]</option>
+                        </select>
+                    </label>
+                    <button class="clear-button" type="button" @click="clearDaySearch">清除筛选</button>
+                    <button
+                        class="refresh-button"
+                        type="button"
+                        title="拉取 Amazon 日数据"
+                        :disabled="dayLoading || crawling || compensating"
+                        @click="crawlDayData"
+                    >
+                        <span aria-hidden="true">↓</span>
+                        <span>[[ crawling ? '拉取中...' : '拉取数据' ]]</span>
+                    </button>
+                    <button
+                        class="refresh-button"
+                        type="button"
+                        title="刷新日数据列表"
+                        :disabled="dayLoading"
+                        @click="loadDayData"
+                    >
+                        <span aria-hidden="true">↻</span>
+                        <span>刷新列表</span>
+                    </button>
+                    <button class="refresh-button" type="button" :disabled="dayLoading || crawling || compensating" @click="compensateDayData">
+                        <span aria-hidden="true">+</span>
+                        <span>[[ compensating ? '补偿中...' : '补偿今天数据' ]]</span>
+                    </button>
+                    <span v-if="crawlJob" role="status" aria-live="polite">
+                        [[ crawlJob.status === 'stopping' ? '正在暂停' : (({queued:'等待开始',primary:'首轮拉取',cooldown:'等待补抓',compensation:'补抓',done:'任务结束',paused:'已暂停',interrupted:'已中断',failed:'任务失败'})[crawlJob.phase] || '准备中') ]]
+                        [[ crawlJob.processed || 0 ]] / [[ crawlJob.total || 0 ]]
+                        <span v-if="crawlJob.pending != null">，上次核对待处理 [[ crawlJob.pending ]] 个</span>
+                    </span>
+                    <button v-if="crawling || compensating" class="refresh-button" type="button"
+                        :disabled="crawlJob && crawlJob.status === 'stopping'" @click="controlCrawlJob('stop')">
+                        [[ crawlJob && crawlJob.status === 'stopping' ? '正在暂停…' : '暂停任务' ]]
+                    </button>
+                    <button v-if="crawlJob && !crawling && !compensating && ['paused','interrupted','failed'].includes(crawlJob.status)"
+                        class="refresh-button" type="button" @click="controlCrawlJob('resume')">继续未完成任务</button>
+                </div>
+
+                <div v-if="scheduledBatch" role="status" aria-live="polite" class="toolbar">
+                    <span>定时批次 [[ scheduledBatch.count_day ]]：
+                        [[ ({preparing:'准备中',running:'执行中',waiting_auth:'等待人工认证',finished:'已结束',paused:'已暂停',failed:'异常停止',interrupted:'调度已中断'})[scheduledBatch.status] || scheduledBatch.status ]]
+                        <span v-if="scheduledBatch.current_site">，当前 [[ scheduledNames[scheduledBatch.current_site] || scheduledBatch.current_site ]]</span>
+                        <span v-if="scheduledBatch.waiting_auth && scheduledBatch.waiting_auth.length">；待认证：[[ scheduledBatch.waiting_auth.map(site => scheduledNames[site] || site).join('、') ]]。请在对应 Chrome 窗口完成人工认证。</span>
+                        <span v-if="scheduledBatch.status === 'finished'">（[[ scheduledBatch.complete ? '数据完整' : '仍有缺失，请检查补拉' ]]）</span>
+                        <span v-if="scheduledBatch.error">，[[ scheduledBatch.error ]]</span>
+                    </span>
+                    <button v-if="scheduledBatch.status === 'waiting_auth'" class="refresh-button" type="button"
+                        :disabled="scheduledResuming || crawling || compensating" @click="controlScheduledBatch('resume-auth')">认证后补拉</button>
+                    <button v-if="['running','preparing'].includes(scheduledBatch.status)" class="refresh-button" type="button"
+                        :disabled="scheduledResuming" @click="controlScheduledBatch('stop')">暂停整个定时批次</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="day-data-table">
+                        <thead>
+                            <tr>
+                                <th v-for="(column, columnIndex) in dayColumns" :key="fieldKey(column) || columnIndex">[[ fieldLabel(column) ]]</th>
+                                <th class="actions-column">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="dayLoading">
+                                <td class="table-message" :colspan="dayColumns.length + 1">正在加载日数据...</td>
+                            </tr>
+                            <tr v-else-if="dayErrorMessage">
+                                <td class="table-message error-message" :colspan="dayColumns.length + 1">[[ dayErrorMessage ]]</td>
+                            </tr>
+                            <tr v-else-if="dayRows.length === 0">
+                                <td class="table-message" :colspan="dayColumns.length + 1">当前日期没有日数据</td>
+                            </tr>
+                            <template v-else>
+                            <tr v-for="row in dayRows" :key="row.id">
+                                <td v-for="(column, columnIndex) in dayColumns" :key="fieldKey(column) || columnIndex">
+                                    <span v-if="isField(column, 'tags')" class="tag-list">
+                                        <span v-for="tag in (row.tags || [])" :key="tag.key" class="day-tag" :class="`day-tag-${tag.color}`">[[ tag.label ]]</span>
+                                        <span v-if="!row.tags || row.tags.length === 0" class="empty-cell">暂无</span>
+                                    </span>
+                                    <span v-else-if="isField(column, 'deal')" class="tag-list deal-list">
+                                        <span v-for="(deal, dealIndex) in (row.deal || [])" :key="`${deal.type}-${dealIndex}`" class="day-tag" :class="`day-tag-${dealColor(deal.type)}`">[[ deal.label ]]</span>
+                                        <span v-if="!row.deal || row.deal.length === 0" class="empty-cell">暂无</span>
+                                    </span>
+                                    <span v-else-if="isField(column, 'buy_box')" class="status-badge" :class="row.buy_box === '1' ? 'status-normal' : (row.buy_box === '0' ? 'status-obsolete' : 'status-unknown')">
+                                        [[ formatBuyBox(row.buy_box) ]]
+                                    </span>
+                                    <a v-else-if="isField(column, 'link') && row.link" class="product-link day-data-link" :href="row.link" :title="row.link" :aria-label="`打开商品链接：${row.link}`" target="_blank" rel="noopener noreferrer">打开</a>
+                                    <span v-else-if="isField(column, 'link')" class="empty-cell">暂无</span>
+                                    <span v-else-if="isField(column, 'picture')" class="picture-cell">
+                                        <a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer">
+                                            <img class="picture-thumbnail" :src="row.picture" :alt="`${row.name || '商品'}图片`" @error="handlePictureError">
+                                            <span class="picture-fallback" hidden>图片加载失败</span>
+                                        </a>
+                                        <span v-else class="picture-empty">暂无图片</span>
+                                    </span>
+                                    <span v-else>[[ displayValue(rawFieldValue(row, column)) ]]</span>
+                                </td>
+                                <td class="actions-column">
+                                    <div class="row-actions">
+                                        <button class="row-action primary" type="button" @click="openDetail(row, dayDetailColumns, true)">查看详情</button>
+                                    </div>
+                                </td>
+                            </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="table-footer">
+                    <span>第 [[ dayPage ]] / [[ dayTotalPages ]] 页</span>
+                    <label class="page-size-control">每页
+                        <select v-model.number="dayPageSize" :disabled="dayLoading" @change="changeDayPageSize">
+                            <option :value="50">50</option>
+                            <option :value="100">100</option>
+                            <option :value="200">200</option>
+                        </select>
+                    </label>
+                    <div class="pagination">
+                        <button type="button" title="上一页" :disabled="dayPage <= 1 || dayLoading" @click="changeDayPage(dayPage - 1)">‹</button>
+                        <button type="button" title="下一页" :disabled="dayPage >= dayTotalPages || dayLoading" @click="changeDayPage(dayPage + 1)">›</button>
+                    </div>
+                </div>
+            </section>
+
+            <section v-else-if="activeView === 'stock-data'" class="content-panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>库存跟进</h2>
+                        <p>查看最近导入日期的库存数据，并按 Seller SKU 追踪历史记录</p>
+                    </div>
+                    <div class="record-count">共 [[ stockTotal ]] 条<span v-if="stockDate"> / [[ stockDate ]]</span></div>
+                </div>
+
+                <div class="toolbar">
+                    <label class="search-box">
+                        <span class="search-icon" aria-hidden="true">⌕</span>
+                        <input
+                            v-model.trim="stockSearch"
+                            type="search"
+                            placeholder="搜索产品、ASIN、Seller SKU、国家、小组..."
+                            autocomplete="off"
+                            @input="scheduleStockSearch"
+                        >
+                    </label>
+                    <button class="clear-button" type="button" @click="clearStockSearch">清除筛选</button>
+                    <button
+                        class="refresh-button"
+                        type="button"
+                        :disabled="stockLoading || stockImporting"
+                        @click="triggerStockImport"
+                    >
+                        <span aria-hidden="true">+</span>
+                        <span>[[ stockImporting ? '导入中...' : '导入库存' ]]</span>
+                    </button>
+                    <button
+                        class="refresh-button"
+                        type="button"
+                        :disabled="stockLoading || stockImporting"
+                        @click="loadStockData"
+                    >
+                        <span aria-hidden="true">↻</span>
+                        <span>刷新列表</span>
+                    </button>
+                    <input
+                        ref="stockImportInput"
+                        class="file-input-hidden"
+                        type="file"
+                        accept=".xlsx"
+                        @change="importStockData"
+                    >
+                </div>
+
+                <div class="metric-board stock-metric-board">
+                    <button
+                        v-for="(card, cardIndex) in stockMetricCards"
+                        :key="fieldKey(card) || cardIndex"
+                        class="metric-card"
+                        :class="{ active: stockMetric === fieldKey(card) }"
+                        type="button"
+                        :disabled="stockLoading"
+                        @click="setStockMetric(fieldKey(card))"
+                    >
+                        <span>[[ fieldLabel(card) ]]</span>
+                        <strong>[[ stockSummaryValue(card) ]]</strong>
+                        <small>[[ card.hint ]]</small>
+                    </button>
+                    <button
+                        v-if="stockMetric"
+                        class="metric-clear"
+                        type="button"
+                        :disabled="stockLoading"
+                        @click="clearStockMetric"
+                    >清除看板筛选</button>
+                </div>
+
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th v-for="(column, columnIndex) in stockColumns" :key="fieldKey(column) || columnIndex">[[ fieldLabel(column) ]]</th>
+                                <th class="actions-column stock-actions-column">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="stockLoading">
+                                <td class="table-message" :colspan="stockColumns.length + 1">正在加载库存数据...</td>
+                            </tr>
+                            <tr v-else-if="stockErrorMessage">
+                                <td class="table-message error-message" :colspan="stockColumns.length + 1">[[ stockErrorMessage ]]</td>
+                            </tr>
+                            <tr v-else-if="stockRows.length === 0">
+                                <td class="table-message" :colspan="stockColumns.length + 1">暂无库存数据</td>
+                            </tr>
+                            <template v-else>
+                            <tr v-for="row in stockRows" :key="row.stock_id">
+                                <td v-for="(column, columnIndex) in stockColumns" :key="fieldKey(column) || columnIndex">
+                                    <a v-if="isField(column, 'link') && row.link" class="product-link" :href="row.link" target="_blank" rel="noopener noreferrer">[[ row.link ]]</a>
+                                    <span v-else-if="isField(column, 'link')" class="empty-cell"></span>
+                                    <span v-else-if="isField(column, 'picture')" class="picture-cell">
+                                        <a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer">
+                                            <img class="picture-thumbnail" :src="row.picture" :alt="`${row.name || '商品'}图片`" @error="handlePictureError">
+                                            <span class="picture-fallback" hidden>图片加载失败</span>
+                                        </a>
+                                        <span v-else class="picture-empty">暂无图片</span>
+                                    </span>
+                                    <span v-else>[[ displayValue(rawFieldValue(row, column), '') ]]</span>
+                                </td>
+                                <td class="actions-column stock-actions-column">
+                                    <div class="row-actions">
+                                        <button class="row-action primary" type="button" @click="openStockDetail(row)">查看详情</button>
+                                    </div>
+                                </td>
+                            </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="table-footer">
+                    <span>第 [[ stockPage ]] / [[ stockTotalPages ]] 页</span>
+                    <label class="page-size-control">每页
+                        <select v-model.number="stockPageSize" :disabled="stockLoading" @change="changeStockPageSize">
+                            <option :value="50">50</option>
+                            <option :value="100">100</option>
+                            <option :value="200">200</option>
+                        </select>
+                    </label>
+                    <div class="pagination">
+                        <button type="button" title="上一页" :disabled="stockPage <= 1 || stockLoading" @click="changeStockPage(stockPage - 1)">‹</button>
+                        <button type="button" title="下一页" :disabled="stockPage >= stockTotalPages || stockLoading" @click="changeStockPage(stockPage + 1)">›</button>
+                    </div>
+                </div>
+            </section>
+
+            <section v-else-if="activeView === 'todo-list'" class="content-panel todo-panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>待办事项</h2>
+                        <p>集中查看待处理和已完成事项</p>
+                    </div>
+                    <div class="record-count">[[ todoMetric === 'pending' ? '待办' : '共' ]] [[ todoTotal ]] 条</div>
+                </div>
+
+                <div class="todo-toolbar">
+                    <button class="refresh-button" type="button" @click="openTodoCreate">
+                        <span aria-hidden="true">+</span>
+                        <span>新增</span>
+                    </button>
+                    <button v-if="todoMetric" class="clear-button" type="button" :disabled="todoLoading" @click="clearTodoMetric">显示全部</button>
+                </div>
+
+                <div class="table-wrap">
+                    <table class="todo-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>创建日期</th>
+                                <th>事项内容</th>
+                                <th>状态</th>
+                                <th class="todo-actions-column">操作</th>
+                                <th>截止日期</th>
+                                <th>重要程度</th>
+                                <th>备注</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="todoLoading">
+                                <td class="table-message" colspan="8">正在加载待办事项...</td>
+                            </tr>
+                            <tr v-else-if="todoErrorMessage">
+                                <td class="table-message error-message" colspan="8">[[ todoErrorMessage ]]</td>
+                            </tr>
+                            <tr v-else-if="todoRows.length === 0">
+                                <td class="table-message" colspan="8">暂无待办事项</td>
+                            </tr>
+                            <template v-else>
+                            <tr v-for="item in todoRows" :key="item.id" :class="{ 'todo-row-complete': String(item.status) === '1' }">
+                                <td>[[ item.id ]]</td>
+                                <td>[[ displayValue(item.create_date) ]]</td>
+                                <td class="todo-content">[[ item.content ]]</td>
+                                <td>
+                                    <span class="status-badge" :class="todoStatusClass(item.status)">[[ formatTodoStatus(item.status) ]]</span>
+                                </td>
+                                <td class="todo-actions-column">
+                                    <button
+                                        v-if="String(item.status) !== '1'"
+                                        class="row-action primary"
+                                        type="button"
+                                        :disabled="todoCompletingId !== null"
+                                        @click="completeTodo(item)"
+                                    >[[ String(todoCompletingId) === String(item.id) ? '处理中...' : '完成' ]]</button>
+                                </td>
+                                <td>[[ displayValue(item.end_date) ]]</td>
+                                <td>
+                                    <span class="todo-importance" :class="`importance-${item.important || 0}`">[[ formatImportance(item.important) ]]</span>
+                                </td>
+                                <td class="todo-remark">[[ displayValue(item.remark) ]]</td>
+                            </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section v-else class="content-panel placeholder-view">
+                <div class="empty-state">
+                    <div class="empty-icon">[[ currentMenu.icon ]]</div>
+                    <h2>[[ currentMenu.label ]]功能准备中</h2>
+                    <p>这个菜单已经预留，后续可以继续接入对应的数据列表。</p>
+                </div>
+            </section>
+        </main>
+
+        <div v-if="detailRow" class="modal-backdrop" @click.self="closeDetail">
+            <section class="detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+                <div class="modal-header">
+                    <div>
+                        <p class="eyebrow">PRODUCT RECORD</p>
+                        <h2 id="detail-title">[[ detailEditing ? '编辑商品' : (detailIsStockData ? '库存历史' : (detailIsDayData ? '日数据详情' : '商品详情')) ]]</h2>
+                    </div>
+                    <button class="modal-close" type="button" title="关闭" :disabled="detailSaving" @click="closeDetail">×</button>
+                </div>
+                <form v-if="detailEditing" class="edit-form" @submit.prevent="saveDetail">
+                    <div class="readonly-grid">
+                        <div v-for="(field, fieldIndex) in editReadonlyFields" :key="fieldKey(field) || fieldIndex" class="detail-item">
+                            <span>[[ fieldLabel(field) ]]</span>
+                            <a
+                                v-if="isField(field, 'link') && detailForm.link"
+                                class="detail-link"
+                                :href="detailForm.link"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                            >[[ detailForm.link ]]</a>
+                            <span
+                                v-else-if="isField(field, 'label')"
+                                class="label-badge"
+                                :class="labelClass(detailForm.label)"
+                            >[[ formatLabel(detailForm.label) ]]</span>
+                            <strong v-else>[[ detailForm[fieldKey(field)] || '暂无' ]]</strong>
+                        </div>
+                    </div>
+                    <div class="edit-grid">
+                        <label v-for="(field, fieldIndex) in editableFields" :key="fieldKey(field) || fieldIndex" class="edit-field" :class="{ 'edit-field-wide': field && field.type === 'textarea' }">
+                            <span>[[ fieldLabel(field) ]]</span>
+                            <textarea
+                                v-if="field && field.type === 'textarea'"
+                                v-model="detailForm[fieldKey(field)]"
+                                :maxlength="field.maxlength"
+                                rows="3"
+                            ></textarea>
+                            <select v-else-if="field && field.type === 'select'" v-model="detailForm[fieldKey(field)]">
+                                <option value="">暂无</option>
+                                <option v-for="option in field.options" :key="option.value" :value="option.value">[[ option.label ]]</option>
+                            </select>
+                            <input
+                                v-else
+                                v-model="detailForm[fieldKey(field)]"
+                                :type="field.type"
+                                :maxlength="field.maxlength"
+                                :min="field.min"
+                                :step="field.step"
+                            >
+                        </label>
+                    </div>
+                    <p v-if="detailSaveError" class="form-error">[[ detailSaveError ]]</p>
+                    <div class="modal-footer">
+                        <button class="modal-button secondary" type="button" :disabled="detailSaving" @click="closeDetail">取消</button>
+                        <button class="modal-button primary" type="submit" :disabled="detailSaving">
+                            [[ detailSaving ? '保存中...' : '保存' ]]
+                        </button>
+                    </div>
+                </form>
+                <div v-else-if="!detailIsStockData" class="detail-grid">
+                    <div v-for="(column, columnIndex) in detailColumns" :key="fieldKey(column) || columnIndex" class="detail-item">
+                        <span>[[ fieldLabel(column) ]]</span>
+                        <a
+                            v-if="isField(column, 'link') && detailRow.link"
+                            class="detail-link"
+                            :href="detailRow.link"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >[[ detailRow.link ]]</a>
+                        <span
+                            v-else-if="isField(column, 'picture')"
+                            class="detail-picture"
+                        >
+                            <a v-if="detailRow.picture" class="picture-link" :href="detailRow.picture" target="_blank" rel="noopener noreferrer">
+                                <img class="picture-thumbnail" :src="detailRow.picture" :alt="`${detailRow.name || '商品'}图片`" @error="handlePictureError">
+                                <span class="picture-fallback" hidden>图片加载失败</span>
+                            </a>
+                            <span v-else class="picture-empty">暂无图片</span>
+                        </span>
+                        <span v-else-if="isField(column, 'deal')" class="tag-list deal-list">
+                            <span v-for="(deal, dealIndex) in (detailRow.deal || [])" :key="`${deal.type}-${dealIndex}`" class="day-tag" :class="`day-tag-${dealColor(deal.type)}`">[[ deal.label ]]</span>
+                            <span v-if="!detailRow.deal || detailRow.deal.length === 0" class="empty-cell">暂无</span>
+                        </span>
+                        <span
+                            v-else-if="isField(column, 'label')"
+                            class="label-badge"
+                            :class="labelClass(detailRow.label)"
+                        >[[ formatLabel(detailRow.label) ]]</span>
+                        <strong v-else-if="isField(column, 'status')">[[ formatStatus(detailRow.status) ]]</strong>
+                        <strong v-else-if="isField(column, 'buy_box')">[[ formatBuyBox(detailRow.buy_box) ]]</strong>
+                        <strong v-else>[[ rawFieldValue(detailRow, column) || '暂无' ]]</strong>
+                    </div>
+                </div>
+                <div v-if="detailIsStockData && !detailEditing" class="stock-history-panel">
+                    <div class="trend-panel-header">
+                        <h3>[[ detailRow.seller_sku ]]</h3>
+                        <span v-if="stockDetailLoading">加载中...</span>
+                        <span v-else-if="stockDetailErrorMessage" class="trend-error">[[ stockDetailErrorMessage ]]</span>
+                        <span v-else>共 [[ stockDetailRows.length ]] 条</span>
+                    </div>
+                    <div class="stock-history-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th v-for="(column, columnIndex) in stockDetailColumns" :key="fieldKey(column) || columnIndex">[[ fieldLabel(column) ]]</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="stockDetailLoading">
+                                    <td class="table-message" :colspan="stockDetailColumns.length">正在加载库存历史...</td>
+                                </tr>
+                                <tr v-else-if="stockDetailErrorMessage">
+                                    <td class="table-message error-message" :colspan="stockDetailColumns.length">[[ stockDetailErrorMessage ]]</td>
+                                </tr>
+                                <tr v-else-if="stockDetailRows.length === 0">
+                                    <td class="table-message" :colspan="stockDetailColumns.length">暂无库存历史</td>
+                                </tr>
+                                <template v-else>
+                                <tr v-for="item in stockDetailRows" :key="item.stock_id">
+                                    <td v-for="(column, columnIndex) in stockDetailColumns" :key="fieldKey(column) || columnIndex">[[ displayValue(rawFieldValue(item, column), '') ]]</td>
+                                </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div v-if="detailIsDayData && !detailEditing" class="trend-panel">
+                    <div class="trend-panel-header">
+                        <h3>最近 7 天趋势</h3>
+                        <span v-if="trendLoading">加载中...</span>
+                        <span v-else-if="trendErrorMessage" class="trend-error">[[ trendErrorMessage ]]</span>
+                    </div>
+                    <div v-if="detailTrend && detailTrend.points && detailTrend.points.length" class="trend-legend" role="group" aria-label="趋势指标">
+                        <button
+                            v-for="series in trendSeries"
+                            :key="series.key"
+                            class="trend-legend-item"
+                            :class="{ active: selectedTrendMetrics.includes(series.key) }"
+                            :style="{ '--trend-color': series.color }"
+                            type="button"
+                            :aria-pressed="selectedTrendMetrics.includes(series.key)"
+                            @click="toggleTrendMetric(series.key)"
+                        >
+                            <span class="trend-legend-swatch" aria-hidden="true"></span>
+                            [[ series.label ]]
+                        </button>
+                    </div>
+                    <div class="trend-chart" v-html="trendMarkup"></div>
+                    <div v-if="!trendLoading && !trendErrorMessage && (!detailTrend || !detailTrend.points || detailTrend.points.length === 0)" class="trend-empty">暂无趋势数据</div>
+                </div>
+            </section>
+        </div>
+
+        <div v-if="todoCreateOpen" class="modal-backdrop" @click.self="closeTodoCreate">
+            <section class="detail-modal todo-modal" role="dialog" aria-modal="true" aria-labelledby="todo-create-title">
+                <div class="modal-header">
+                    <div>
+                        <h2 id="todo-create-title">新增待办事项</h2>
+                    </div>
+                    <button class="modal-close" type="button" title="关闭" :disabled="todoSaving" @click="closeTodoCreate">×</button>
+                </div>
+                <form class="edit-form" @submit.prevent="saveTodo">
+                    <div class="edit-grid todo-form-grid">
+                        <label class="edit-field">
+                            <span>创建日期</span>
+                            <input v-model="todoForm.create_date" type="date" required>
+                        </label>
+                        <label class="edit-field">
+                            <span>状态</span>
+                            <select v-model="todoForm.status">
+                                <option value="0">未完成</option>
+                                <option value="1">已完成</option>
+                            </select>
+                        </label>
+                        <label class="edit-field edit-field-wide">
+                            <span>事项内容</span>
+                            <textarea v-model.trim="todoForm.content" maxlength="500" rows="4" required></textarea>
+                        </label>
+                        <label class="edit-field">
+                            <span>截止日期</span>
+                            <input v-model="todoForm.end_date" type="date">
+                        </label>
+                        <label class="edit-field">
+                            <span>重要程度</span>
+                            <select v-model="todoForm.important">
+                                <option value="5">紧急</option>
+                                <option value="4">高</option>
+                                <option value="3">中</option>
+                                <option value="2">普通</option>
+                                <option value="1">低</option>
+                            </select>
+                        </label>
+                        <label class="edit-field edit-field-wide">
+                            <span>备注</span>
+                            <textarea v-model.trim="todoForm.remark" maxlength="1000" rows="4"></textarea>
+                        </label>
+                    </div>
+                    <p v-if="todoSaveError" class="form-error">[[ todoSaveError ]]</p>
+                    <div class="modal-footer">
+                        <button class="modal-button secondary" type="button" :disabled="todoSaving" @click="closeTodoCreate">取消</button>
+                        <button class="modal-button primary" type="submit" :disabled="todoSaving">
+                            [[ todoSaving ? '保存中...' : '保存' ]]
+                        </button>
+                    </div>
+                </form>
+            </section>
+        </div>
+
+        <div v-if="toastMessage" class="toast show" role="status">[[ toastMessage ]]</div>
+    </div>
+
+    <script src="{{ url_for('static', filename='vue.global.prod.js') }}?v=3.5.18"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20261020_scheduled_auth"></script>
+</body>
+</html>
