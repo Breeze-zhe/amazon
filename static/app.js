@@ -10,6 +10,7 @@ const app = createApp({
     data() {
         return {
             activeView: "data-overview",
+            settingsMenuExpanded: false,
             overviewLoading: false,
             overviewLoaded: false,
             overviewErrorMessage: "",
@@ -87,6 +88,26 @@ const app = createApp({
             stockDetailLoading: false,
             stockDetailErrorMessage: "",
             todoRows: [],
+            settingsRows: [],
+            settingsTotal: 0,
+            settingsPage: 1,
+            settingsPageSize: 50,
+            settingsTotalPages: 1,
+            settingsSearch: "",
+            settingsLoading: false,
+            settingsErrorMessage: "",
+            tagGroupFormOpen: false,
+            tagGroupEditingId: null,
+            tagGroupSaving: false,
+            tagGroupSaveError: "",
+            tagGroupForm: { group_name: "", sort_no: 0, status: 1, remark: "" },
+            tagFormOpen: false,
+            tagEditingId: null,
+            tagSaving: false,
+            tagSaveError: "",
+            tagGroupOptions: [],
+            tagForm: { group_id: "", tag_name: "", color: "", sort_no: 0, status: 1, remark: "" },
+            tagColorHex: "#147d92",
             todoTotal: 0,
             todoMetric: "",
             todoLoading: false,
@@ -144,7 +165,10 @@ const app = createApp({
                 { key: "day-data", label: "日数据跟进", icon: "D" },
                 { key: "stock-data", label: "库存跟进", icon: "K" },
                 { key: "ad-activity", label: "广告活动", icon: "A" },
-                { key: "settings", label: "系统设置", icon: "T" },
+                { key: "base-settings", label: "基础设置", icon: "⚙", children: [
+                    { key: "tag-groups", label: "标签组" },
+                    { key: "tags", label: "标签" },
+                ] },
             ],
             overviewSections: [
                 {
@@ -1303,6 +1327,7 @@ const app = createApp({
             this.loadDayData();
         },
         async selectMenu(item) {
+            if (!item || item.children) return;
             this.activeView = item.key;
             this.closeDetail();
             if (item.key === "data-overview") {
@@ -1321,6 +1346,134 @@ const app = createApp({
             }
             if (item.key === "todo-list" && this.todoRows.length === 0) {
                 this.loadTodoList();
+            }
+            if (item.key === "tag-groups" || item.key === "tags") {
+                this.settingsPage = 1;
+                this.settingsSearch = "";
+                this.loadSettingsTags();
+            }
+        },
+        toggleMenu(item) {
+            if (item && item.children) {
+                this.settingsMenuExpanded = !this.settingsMenuExpanded;
+                return;
+            }
+            this.selectMenu(item);
+        },
+        async loadSettingsTags() {
+            this.settingsLoading = true;
+            this.settingsErrorMessage = "";
+            const kind = this.activeView === "tag-groups" ? "tag-groups" : "tags";
+            const query = new URLSearchParams({ page: this.settingsPage, page_size: this.settingsPageSize, search: this.settingsSearch });
+            try {
+                const response = await fetch(`/api/settings/${kind}?${query}`);
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "列表加载失败");
+                this.settingsRows = result.rows;
+                this.settingsTotal = result.total;
+                this.settingsTotalPages = result.total_pages;
+            } catch (error) {
+                this.settingsErrorMessage = error.message;
+            } finally {
+                this.settingsLoading = false;
+            }
+        },
+        openTagGroupForm(row = null) {
+            this.tagGroupEditingId = row ? Number(row.id) : null;
+            this.tagGroupForm = row
+                ? { group_name: row.group_name || "", sort_no: Number(row.sort_no || 0), status: Number(row.status), remark: row.remark || "" }
+                : { group_name: "", sort_no: 0, status: 1, remark: "" };
+            this.tagGroupSaveError = "";
+            this.tagGroupFormOpen = true;
+        },
+        closeTagGroupForm() {
+            if (this.tagGroupSaving) return;
+            this.tagGroupFormOpen = false;
+        },
+        async saveTagGroup() {
+            if (this.tagGroupSaving) return;
+            this.tagGroupSaving = true;
+            this.tagGroupSaveError = "";
+            try {
+                const editing = this.tagGroupEditingId !== null;
+                const response = await fetch(editing ? `/api/settings/tag-groups/${this.tagGroupEditingId}` : "/api/settings/tag-groups", {
+                    method: editing ? "PATCH" : "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(this.tagGroupForm),
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "保存失败");
+                this.tagGroupFormOpen = false;
+                await this.loadSettingsTags();
+            } catch (error) {
+                this.tagGroupSaveError = error.message;
+            } finally {
+                this.tagGroupSaving = false;
+            }
+        },
+        async deactivateTagGroup(row) {
+            if (!row || Number(row.status) === 0 || !window.confirm(`确定停用标签组“${row.group_name}”吗？记录会保留在数据库中。`)) return;
+            try {
+                const response = await fetch(`/api/settings/tag-groups/${row.id}`, { method: "DELETE" });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "停用失败");
+                await this.loadSettingsTags();
+            } catch (error) {
+                this.showToast(error.message);
+            }
+        },
+        async openTagForm(row = null) {
+            this.tagSaveError = "";
+            try {
+                const response = await fetch("/api/settings/tag-groups?page=1&page_size=200");
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "标签组加载失败");
+                this.tagGroupOptions = result.rows.filter((group) => Number(group.status) === 1);
+                this.tagEditingId = row ? Number(row.id) : null;
+                this.tagForm = row
+                    ? { group_id: String(row.group_id), tag_name: row.tag_name || "", color: row.color || "", sort_no: Number(row.sort_no || 0), status: Number(row.status), remark: row.remark || "" }
+                    : { group_id: this.tagGroupOptions[0] ? String(this.tagGroupOptions[0].id) : "", tag_name: "", color: "", sort_no: 0, status: 1, remark: "" };
+                const rgb = String(this.tagForm.color).match(/(?:RGB)?\s*\(?\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)?/i);
+                this.tagColorHex = rgb ? `#${rgb.slice(1).map((part) => Number(part).toString(16).padStart(2, "0")).join("")}` : "#147d92";
+                this.tagFormOpen = true;
+            } catch (error) {
+                this.showToast(error.message);
+            }
+        },
+        closeTagForm() {
+            if (this.tagSaving) return;
+            this.tagFormOpen = false;
+        },
+        async saveTag() {
+            if (this.tagSaving) return;
+            this.tagSaving = true;
+            this.tagSaveError = "";
+            try {
+                const editing = this.tagEditingId !== null;
+                const response = await fetch(editing ? `/api/settings/tags/${this.tagEditingId}` : "/api/settings/tags", {
+                    method: editing ? "PATCH" : "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ ...this.tagForm, color: `RGB(${parseInt(this.tagColorHex.slice(1, 3), 16)},${parseInt(this.tagColorHex.slice(3, 5), 16)},${parseInt(this.tagColorHex.slice(5, 7), 16)})` }),
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "保存失败");
+                this.tagFormOpen = false;
+                await this.loadSettingsTags();
+            } catch (error) {
+                this.tagSaveError = error.message;
+            } finally {
+                this.tagSaving = false;
+            }
+        },
+        async deactivateTag(row) {
+            if (!row || Number(row.status) === 0 || !window.confirm(`确定停用标签“${row.tag_name}”吗？记录会保留在数据库中。`)) return;
+            try {
+                const response = await fetch(`/api/settings/tags/${row.id}`, { method: "DELETE" });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "停用失败");
+                await this.loadSettingsTags();
+            } catch (error) {
+                this.showToast(error.message);
             }
         },
         openDetail(row, columns = this.columns, isDayData = false) {

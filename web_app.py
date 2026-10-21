@@ -926,6 +926,206 @@ def basic_info():
         return jsonify({"success": False, "message": str(exc)}), 500
 
 
+@app.get("/api/settings/tag-groups")
+def tag_groups():
+    return settings_tag_list("group")
+
+
+@app.get("/api/settings/tags")
+def tags():
+    return settings_tag_list("tag")
+
+
+def settings_tag_list(kind: str):
+    """Read-only, paginated lists for the two tag configuration tables."""
+    page = max(request.args.get("page", 1, type=int), 1)
+    page_size = min(max(request.args.get("page_size", 50, type=int), 1), 200)
+    search = (request.args.get("search", "", type=str) or "").strip()
+    offset = (page - 1) * page_size
+    if kind == "group":
+        table = "amz_tag_group"
+        fields = "id, group_name, sort_no, status, remark, create_time, updated_time"
+        searchable = ("group_name", "remark")
+        query = f"SELECT {fields} FROM `{table}`"
+    else:
+        table = "amz_tag"
+        fields = "t.id, t.group_id, g.group_name, t.tag_name, t.color, t.sort_no, t.status, t.remark, t.create_time, t.update_time"
+        searchable = ("t.tag_name", "g.group_name", "t.remark", "t.color")
+        query = f"SELECT {fields} FROM `{table}` t LEFT JOIN `amz_tag_group` g ON g.id = t.group_id"
+    where_sql = ""
+    params: list[object] = []
+    if search:
+        where_sql = " WHERE " + " OR ".join(f"CAST({column} AS CHAR) LIKE %s" for column in searchable)
+        params = [f"%{search}%"] * len(searchable)
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS total FROM `{table}`" + (" t LEFT JOIN `amz_tag_group` g ON g.id = t.group_id" if kind == "tag" else "") + where_sql, params)
+                total = int(cursor.fetchone()["total"])
+                cursor.execute(query + where_sql + f" ORDER BY {'id' if kind == 'group' else 't.id'} ASC LIMIT %s OFFSET %s", [*params, page_size, offset])
+                rows = [{key: serialize_value(value) for key, value in row.items()} for row in cursor.fetchall()]
+        return jsonify({"success": True, "rows": rows, "total": total, "page": page, "page_size": page_size, "total_pages": max((total + page_size - 1) // page_size, 1)})
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+def tag_group_payload():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return None, (jsonify({"success": False, "message": "请求内容格式不正确"}), 400)
+    name = str(payload.get("group_name") or "").strip()
+    remark = str(payload.get("remark") or "").strip()
+    try:
+        sort_no = int(payload.get("sort_no", 0) or 0)
+        status = int(payload.get("status", 1))
+    except (TypeError, ValueError):
+        return None, (jsonify({"success": False, "message": "排序和状态必须是有效数字"}), 400)
+    if not name or len(name) > 64:
+        return None, (jsonify({"success": False, "message": "标签组名称为必填，且不能超过 64 个字符"}), 400)
+    if len(remark) > 255 or status not in (0, 1):
+        return None, (jsonify({"success": False, "message": "备注最多 255 个字符，状态只能为启用或停用"}), 400)
+    return {"group_name": name, "sort_no": sort_no, "status": status, "remark": remark or None}, None
+
+
+@app.post("/api/settings/tag-groups")
+def create_tag_group():
+    values, error = tag_group_payload()
+    if error:
+        return error
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("INSERT INTO `amz_tag_group` (`group_name`, `sort_no`, `status`, `remark`) VALUES (%s, %s, %s, %s)", tuple(values.values()))
+                group_id = cursor.lastrowid
+            connection.commit()
+        return jsonify({"success": True, "id": group_id}), 201
+    except Exception as exc:
+        if getattr(exc, "args", [None])[0] == 1062:
+            return jsonify({"success": False, "message": "标签组名称已存在"}), 409
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@app.patch("/api/settings/tag-groups/<int:group_id>")
+def update_tag_group(group_id: int):
+    values, error = tag_group_payload()
+    if error:
+        return error
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE `amz_tag_group` SET `group_name`=%s, `sort_no`=%s, `status`=%s, `remark`=%s WHERE `id`=%s", (*values.values(), group_id))
+                if cursor.rowcount == 0:
+                    cursor.execute("SELECT `id` FROM `amz_tag_group` WHERE `id`=%s", (group_id,))
+                    if not cursor.fetchone():
+                        return jsonify({"success": False, "message": "标签组不存在"}), 404
+            connection.commit()
+        return jsonify({"success": True})
+    except Exception as exc:
+        if getattr(exc, "args", [None])[0] == 1062:
+            return jsonify({"success": False, "message": "标签组名称已存在"}), 409
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@app.delete("/api/settings/tag-groups/<int:group_id>")
+def deactivate_tag_group(group_id: int):
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE `amz_tag_group` SET `status`=0 WHERE `id`=%s", (group_id,))
+                if cursor.rowcount == 0:
+                    cursor.execute("SELECT `id` FROM `amz_tag_group` WHERE `id`=%s", (group_id,))
+                    if not cursor.fetchone():
+                        return jsonify({"success": False, "message": "标签组不存在"}), 404
+            connection.commit()
+        return jsonify({"success": True, "logical_delete": True})
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+def tag_payload():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return None, (jsonify({"success": False, "message": "请求内容格式不正确"}), 400)
+    name = str(payload.get("tag_name") or "").strip()
+    color = str(payload.get("color") or "").strip()
+    remark = str(payload.get("remark") or "").strip()
+    try:
+        group_id = int(payload.get("group_id"))
+        sort_no = int(payload.get("sort_no", 0) or 0)
+        status = int(payload.get("status", 1))
+    except (TypeError, ValueError):
+        return None, (jsonify({"success": False, "message": "标签组、排序和状态必须是有效数字"}), 400)
+    rgb = re.fullmatch(r"(?:RGB)?\s*\(?\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)?", color, re.IGNORECASE) if color else None
+    if color and (not rgb or any(int(channel) > 255 for channel in rgb.groups())):
+        return None, (jsonify({"success": False, "message": "请选择有效颜色"}), 400)
+    if rgb:
+        color = f"RGB({int(rgb.group(1))},{int(rgb.group(2))},{int(rgb.group(3))})"
+    if not name or len(name) > 64 or len(color) > 50 or len(remark) > 255 or status not in (0, 1):
+        return None, (jsonify({"success": False, "message": "请检查必填项及字段长度；状态只能为启用或停用"}), 400)
+    return {"group_id": group_id, "tag_name": name, "color": color or None, "sort_no": sort_no, "status": status, "remark": remark or None}, None
+
+
+@app.post("/api/settings/tags")
+def create_tag():
+    values, error = tag_payload()
+    if error:
+        return error
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT `id` FROM `amz_tag_group` WHERE `id`=%s", (values["group_id"],))
+                if not cursor.fetchone():
+                    return jsonify({"success": False, "message": "所选标签组不存在"}), 400
+                cursor.execute("INSERT INTO `amz_tag` (`group_id`, `tag_name`, `color`, `sort_no`, `status`, `remark`) VALUES (%s, %s, %s, %s, %s, %s)", tuple(values.values()))
+                tag_id = cursor.lastrowid
+            connection.commit()
+        return jsonify({"success": True, "id": tag_id}), 201
+    except Exception as exc:
+        if getattr(exc, "args", [None])[0] == 1062:
+            return jsonify({"success": False, "message": "该标签组中已存在同名标签"}), 409
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@app.patch("/api/settings/tags/<int:tag_id>")
+def update_tag(tag_id: int):
+    values, error = tag_payload()
+    if error:
+        return error
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT `id` FROM `amz_tag_group` WHERE `id`=%s", (values["group_id"],))
+                if not cursor.fetchone():
+                    return jsonify({"success": False, "message": "所选标签组不存在"}), 400
+                cursor.execute("UPDATE `amz_tag` SET `group_id`=%s, `tag_name`=%s, `color`=%s, `sort_no`=%s, `status`=%s, `remark`=%s WHERE `id`=%s", (*values.values(), tag_id))
+                if cursor.rowcount == 0:
+                    cursor.execute("SELECT `id` FROM `amz_tag` WHERE `id`=%s", (tag_id,))
+                    if not cursor.fetchone():
+                        return jsonify({"success": False, "message": "标签不存在"}), 404
+            connection.commit()
+        return jsonify({"success": True})
+    except Exception as exc:
+        if getattr(exc, "args", [None])[0] == 1062:
+            return jsonify({"success": False, "message": "该标签组中已存在同名标签"}), 409
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@app.delete("/api/settings/tags/<int:tag_id>")
+def deactivate_tag(tag_id: int):
+    try:
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE `amz_tag` SET `status`=0 WHERE `id`=%s", (tag_id,))
+                if cursor.rowcount == 0:
+                    cursor.execute("SELECT `id` FROM `amz_tag` WHERE `id`=%s", (tag_id,))
+                    if not cursor.fetchone():
+                        return jsonify({"success": False, "message": "标签不存在"}), 404
+            connection.commit()
+        return jsonify({"success": True, "logical_delete": True})
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
 @app.get("/api/basic-info/operations")
 def basic_info_operations():
     try:

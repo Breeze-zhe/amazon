@@ -112,6 +112,38 @@ button {
     background: rgba(255, 255, 255, .1);
 }
 
+.submenu {
+    display: grid;
+    gap: 2px;
+    margin: 2px 0 8px 34px;
+}
+
+.submenu-chevron {
+    margin-left: auto;
+    transition: transform .15s ease;
+}
+
+.submenu-chevron.expanded {
+    transform: rotate(90deg);
+}
+
+.submenu-item {
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted, #687482);
+    cursor: pointer;
+    font: inherit;
+    padding: 9px 12px;
+    text-align: left;
+}
+
+.submenu-item:hover,
+.submenu-item.active {
+    background: rgba(20, 125, 146, .1);
+    color: var(--accent, #147d92);
+}
+
 .menu-item.active {
     box-shadow: inset 3px 0 0 #66c5d1;
 }
@@ -666,6 +698,23 @@ tbody tr:hover .actions-column {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+}
+
+.tag-color-swatch {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-right: 7px;
+    vertical-align: -3px;
+    border: 1px solid rgba(0, 0, 0, .18);
+    border-radius: 4px;
+}
+
+.tag-color-picker {
+    width: 64px;
+    min-height: 38px;
+    padding: 4px;
+    cursor: pointer;
 }
 
 .row-action {

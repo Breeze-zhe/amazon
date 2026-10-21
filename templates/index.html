@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Amazon 数据中心</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=20261019_1">
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=20261021_tag_crud_rgb">
 </head>
 <body>
     <div id="app" class="app-shell">
@@ -18,17 +18,16 @@
             </div>
 
             <nav class="menu" aria-label="主菜单">
-                <button
-                    v-for="(item, itemIndex) in menuItems"
-                    :key="fieldKey(item) || itemIndex"
-                    class="menu-item"
-                    :class="{ active: activeView === fieldKey(item) }"
-                    type="button"
-                    @click="selectMenu(item)"
-                >
-                    <span class="menu-icon" aria-hidden="true">[[ item && item.icon ? item.icon : "" ]]</span>
-                    <span>[[ fieldLabel(item) ]]</span>
-                </button>
+                <div v-for="(item, itemIndex) in menuItems" :key="fieldKey(item) || itemIndex">
+                    <button class="menu-item" :class="{ active: activeView === fieldKey(item) || (item.children && item.children.some(child => activeView === child.key)) }" type="button" :aria-expanded="item.children ? settingsMenuExpanded : undefined" @click="toggleMenu(item)">
+                        <span class="menu-icon" aria-hidden="true">[[ item && item.icon ? item.icon : "" ]]</span>
+                        <span>[[ fieldLabel(item) ]]</span>
+                        <span v-if="item.children" class="submenu-chevron" :class="{ expanded: settingsMenuExpanded }" aria-hidden="true">›</span>
+                    </button>
+                    <div v-if="item.children && settingsMenuExpanded" class="submenu">
+                        <button v-for="child in item.children" :key="child.key" class="submenu-item" :class="{ active: activeView === child.key }" type="button" @click="selectMenu(child)">[[ child.label ]]</button>
+                    </div>
+                </div>
             </nav>
 
             <div class="sidebar-footer">
@@ -83,6 +82,39 @@
                         </button>
                     </div>
                 </section>
+            </section>
+
+            <section v-else-if="activeView === 'tag-groups' || activeView === 'tags'" class="content-panel">
+                <div class="panel-heading">
+                    <div><h2>[[ activeView === 'tag-groups' ? '标签组' : '标签' ]]</h2><p>[[ activeView === 'tag-groups' ? '管理标签组；删除操作为逻辑删除，只停用并保留记录' : '管理标签；删除操作为逻辑删除，只停用并保留记录' ]]</p></div>
+                    <div class="record-count">共 [[ settingsTotal ]] 条</div>
+                </div>
+                <div v-if="activeView === 'tag-groups'" class="toolbar"><button class="row-action primary" type="button" @click="openTagGroupForm()">新增标签组</button></div>
+                <div v-else class="toolbar"><button class="row-action primary" type="button" @click="openTagForm()">新增标签</button></div>
+                <div class="toolbar">
+                    <label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input v-model.trim="settingsSearch" type="search" placeholder="搜索名称、所属标签组或备注..." @input="settingsPage = 1; loadSettingsTags()"></label>
+                </div>
+                <div v-if="settingsLoading" class="empty-state">正在加载...</div>
+                <div v-else-if="settingsErrorMessage" class="empty-state">加载失败：[[ settingsErrorMessage ]]</div>
+                <div v-else class="table-wrap"><table><thead><tr>
+                    <th>ID</th><th v-if="activeView === 'tag-groups'">标签组名称</th><th v-else>标签名称</th><th v-if="activeView === 'tags'">所属标签组</th><th v-if="activeView === 'tags'">颜色</th><th>排序</th><th>状态</th><th>备注</th><th>创建时间</th><th>操作</th>
+                </tr></thead><tbody><tr v-for="row in settingsRows" :key="row.id">
+                    <td>[[ row.id ]]</td><td>[[ activeView === 'tag-groups' ? row.group_name : row.tag_name ]]</td><td v-if="activeView === 'tags'">[[ row.group_name || '—' ]]</td><td v-if="activeView === 'tags'"><span v-if="row.color" class="tag-color-swatch" :style="{ backgroundColor: row.color }"></span>[[ row.color || '—' ]]</td><td>[[ row.sort_no ]]</td><td>[[ String(row.status) === '1' ? '启用' : '停用' ]]</td><td>[[ row.remark || '—' ]]</td><td>[[ row.create_time || '—' ]]</td><td><div class="row-actions"><button v-if="activeView === 'tag-groups'" class="row-action primary" type="button" @click="openTagGroupForm(row)">编辑</button><button v-else class="row-action primary" type="button" @click="openTagForm(row)">编辑</button><button class="row-action danger-action" type="button" :disabled="String(row.status) === '0'" @click="activeView === 'tag-groups' ? deactivateTagGroup(row) : deactivateTag(row)">停用</button></div></td>
+                </tr><tr v-if="settingsRows.length === 0"><td :colspan="activeView === 'tags' ? 9 : 7" class="empty-state">暂无数据</td></tr></tbody></table></div>
+                <div class="table-footer">
+                    <span>总数：[[ settingsTotal ]] 条 · 第 [[ settingsPage ]] / [[ settingsTotalPages ]] 页</span>
+                    <label class="page-size-control">每页
+                        <select v-model.number="settingsPageSize" :disabled="settingsLoading" @change="settingsPage = 1; loadSettingsTags()">
+                            <option :value="50">50</option>
+                            <option :value="100">100</option>
+                            <option :value="200">200</option>
+                        </select>
+                    </label>
+                    <div class="pagination">
+                        <button type="button" title="上一页" :disabled="settingsPage <= 1 || settingsLoading" @click="settingsPage--; loadSettingsTags()">‹</button>
+                        <button type="button" title="下一页" :disabled="settingsPage >= settingsTotalPages || settingsLoading" @click="settingsPage++; loadSettingsTags()">›</button>
+                    </div>
+                </div>
             </section>
 
             <section v-else-if="activeView === 'basic-info'" class="content-panel">
@@ -230,7 +262,7 @@
                 </div>
 
                 <div class="table-footer">
-                    <span>第 [[ page ]] / [[ totalPages ]] 页</span>
+                    <span>总数：[[ total ]] 条 · 第 [[ page ]] / [[ totalPages ]] 页</span>
                     <label class="page-size-control">每页
                         <select v-model.number="pageSize" :disabled="loading" @change="changePageSize">
                             <option :value="50">50</option>
@@ -409,7 +441,7 @@
                 </div>
 
                 <div class="table-footer">
-                    <span>第 [[ dayPage ]] / [[ dayTotalPages ]] 页</span>
+                    <span>总数：[[ dayTotal ]] 条 · 第 [[ dayPage ]] / [[ dayTotalPages ]] 页</span>
                     <label class="page-size-control">每页
                         <select v-model.number="dayPageSize" :disabled="dayLoading" @change="changeDayPageSize">
                             <option :value="50">50</option>
@@ -539,7 +571,7 @@
                 </div>
 
                 <div class="table-footer">
-                    <span>第 [[ stockPage ]] / [[ stockTotalPages ]] 页</span>
+                    <span>总数：[[ stockTotal ]] 条 · 第 [[ stockPage ]] / [[ stockTotalPages ]] 页</span>
                     <label class="page-size-control">每页
                         <select v-model.number="stockPageSize" :disabled="stockLoading" @change="changeStockPageSize">
                             <option :value="50">50</option>
@@ -786,6 +818,41 @@
             </section>
         </div>
 
+        <div v-if="tagFormOpen" class="modal-backdrop" @click.self="closeTagForm">
+            <section class="detail-modal todo-modal" role="dialog" aria-modal="true" aria-labelledby="tag-form-title">
+                <div class="modal-header"><h2 id="tag-form-title">[[ tagEditingId ? '编辑标签' : '新增标签' ]]</h2><button class="modal-close" type="button" :disabled="tagSaving" @click="closeTagForm">×</button></div>
+                <form class="edit-form" @submit.prevent="saveTag">
+                    <div class="edit-grid">
+                        <label class="edit-field edit-field-wide"><span>所属标签组</span><select v-model="tagForm.group_id" required><option value="" disabled>请选择标签组</option><option v-for="group in tagGroupOptions" :key="group.id" :value="String(group.id)">[[ group.group_name ]]</option></select></label>
+                        <label class="edit-field edit-field-wide"><span>标签名称</span><input v-model.trim="tagForm.tag_name" maxlength="64" required></label>
+                        <label class="edit-field"><span>颜色（RGB）</span><input v-model="tagColorHex" class="tag-color-picker" type="color" aria-label="选择标签颜色"></label>
+                        <label class="edit-field"><span>排序</span><input v-model.number="tagForm.sort_no" type="number" required></label>
+                        <label class="edit-field"><span>状态</span><select v-model.number="tagForm.status"><option :value="1">启用</option><option :value="0">停用</option></select></label>
+                        <label class="edit-field edit-field-wide"><span>备注</span><textarea v-model.trim="tagForm.remark" maxlength="255" rows="3"></textarea></label>
+                    </div>
+                    <p class="form-hint">保存到数据库的颜色格式：RGB(r,g,b)，当前为 RGB([[ parseInt(tagColorHex.slice(1, 3), 16) ]],[[ parseInt(tagColorHex.slice(3, 5), 16) ]],[[ parseInt(tagColorHex.slice(5, 7), 16) ]])</p>
+                    <p v-if="tagSaveError" class="form-error">[[ tagSaveError ]]</p>
+                    <div class="modal-footer"><button class="modal-button secondary" type="button" :disabled="tagSaving" @click="closeTagForm">取消</button><button class="modal-button primary" type="submit" :disabled="tagSaving || tagGroupOptions.length === 0">[[ tagSaving ? '保存中...' : '保存' ]]</button></div>
+                </form>
+            </section>
+        </div>
+
+        <div v-if="tagGroupFormOpen" class="modal-backdrop" @click.self="closeTagGroupForm">
+            <section class="detail-modal todo-modal" role="dialog" aria-modal="true" aria-labelledby="tag-group-form-title">
+                <div class="modal-header"><h2 id="tag-group-form-title">[[ tagGroupEditingId ? '编辑标签组' : '新增标签组' ]]</h2><button class="modal-close" type="button" :disabled="tagGroupSaving" @click="closeTagGroupForm">×</button></div>
+                <form class="edit-form" @submit.prevent="saveTagGroup">
+                    <div class="edit-grid">
+                        <label class="edit-field edit-field-wide"><span>标签组名称</span><input v-model.trim="tagGroupForm.group_name" maxlength="64" required></label>
+                        <label class="edit-field"><span>排序</span><input v-model.number="tagGroupForm.sort_no" type="number" required></label>
+                        <label class="edit-field"><span>状态</span><select v-model.number="tagGroupForm.status"><option :value="1">启用</option><option :value="0">停用</option></select></label>
+                        <label class="edit-field edit-field-wide"><span>备注</span><textarea v-model.trim="tagGroupForm.remark" maxlength="255" rows="3"></textarea></label>
+                    </div>
+                    <p v-if="tagGroupSaveError" class="form-error">[[ tagGroupSaveError ]]</p>
+                    <div class="modal-footer"><button class="modal-button secondary" type="button" :disabled="tagGroupSaving" @click="closeTagGroupForm">取消</button><button class="modal-button primary" type="submit" :disabled="tagGroupSaving">[[ tagGroupSaving ? '保存中...' : '保存' ]]</button></div>
+                </form>
+            </section>
+        </div>
+
         <div v-if="todoCreateOpen" class="modal-backdrop" @click.self="closeTodoCreate">
             <section class="detail-modal todo-modal" role="dialog" aria-modal="true" aria-labelledby="todo-create-title">
                 <div class="modal-header">
@@ -845,6 +912,6 @@
     </div>
 
     <script src="{{ url_for('static', filename='vue.global.prod.js') }}?v=3.5.18"></script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20261020_scheduled_auth"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20261021_tag_crud_rgb"></script>
 </body>
 </html>
