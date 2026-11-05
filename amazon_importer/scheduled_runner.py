@@ -77,7 +77,9 @@ def acquire_locks():
 def load_scopes():
     from web_app import connect, database_config, fetch_targets
     with connect(**database_config()) as connection:
-        targets = fetch_targets(connection, exclude_activity=True, exclude_broken_links=True)
+        # Scheduled daily batches include products in advertising campaigns.
+        # ``deal`` collection remains disabled by the crawl payload below.
+        targets = fetch_targets(connection, exclude_activity=False)
     unsupported = {t['country'] for t in targets} - set(SITE_SESSIONS)
     if unsupported:
         raise ValueError(f'Unsupported marketplaces: {sorted(unsupported)}')
@@ -98,7 +100,7 @@ def validate_resume(state):
 
 
 def payload_for(site, ids, day, browser='chrome', *, resume=True,
-                exclude_activity=True, skip_broken_links=True):
+                exclude_activity=False):
     options = dict(browser=browser, data_ids=ids, count_day=day,
                    compensation_browser=browser)
     if browser == 'chrome':
@@ -106,7 +108,7 @@ def payload_for(site, ids, day, browser='chrome', *, resume=True,
     payload = compensation_browser_options(options, browser=browser)
     payload.update(skip_deal=True, exclude_activity=exclude_activity, resume=resume,
                    auto_compensate=True, compensation_rounds=2,
-                   pause_on_auth=True, skip_broken_links=skip_broken_links, **{'async': True})
+                   pause_on_auth=True, **{'async': True})
     return payload
 
 
@@ -132,7 +134,11 @@ def wait_job(session, base_url, job_id, state, deadline):
         time.sleep(5)
 
 
-def execute(session, base_url, state, sites, log, deadline):
+def execute(session, base_url, state, sites, log, deadline, *, parallel_sites=1,
+            finalize=True, resume_completed=None):
+    if parallel_sites > 1 and len(sites) > 1:
+        return execute_parallel_sites(session, base_url, state, sites, log, deadline,
+                                      max_parallel=parallel_sites)
     state.setdefault('waiting_auth_browser', {})
     for site in sites:
         ensure_same_day(state)
@@ -143,12 +149,13 @@ def execute(session, base_url, state, sites, log, deadline):
         if time.monotonic() >= deadline:
             raise TimeoutError('批次时间预算已用完，未启动下一站')
         ids = state['scopes'][site]
+        resume = (not bool(state.get('force_refresh', False))
+                  if resume_completed is None else bool(resume_completed))
         payload_options = dict(
-            resume=not bool(state.get('force_refresh', False)),
-            exclude_activity=bool(state.get('exclude_activity', True)),
-            skip_broken_links=bool(state.get('skip_broken_links', True)),
+            resume=resume,
+            exclude_activity=bool(state.get('exclude_activity', False)),
         )
-        state.update(status='running', current_site=site, current_job=None)
+        state.update(status='running', current_site=site, current_sites=[site], current_job=None)
         save_state(state)
         if not ids:
             state['results'][site] = dict(status='empty', complete=True)
@@ -232,15 +239,106 @@ def execute(session, base_url, state, sites, log, deadline):
             state['waiting_auth_browser'].pop(site, None)
         state['results'][site]['browser'] = browser
         save_state(state)
+    if not finalize:
+        # A site waiting for authentication is a valid intermediate result;
+        # incomplete results are also recorded while the batch continues.
+        return 0
     if stopped(state):
         state.update(status='paused')
         save_state(state)
         return 1
     state.update(status='waiting_auth' if state['waiting_auth'] else 'finished',
-                 current_site=None, current_job=None,
+                 current_site=None, current_sites=[], current_job=None,
                  complete=all(r.get('complete', False) for r in state['results'].values()))
     save_state(state)
     unknown = any(not r.get('complete') and r.get('remaining') is None for r in state['results'].values())
+    remaining = 'unknown' if unknown else sum(r.get('remaining') or 0 for r in state['results'].values())
+    log(f'finish complete={state["complete"]} waiting_auth={state["waiting_auth"]} remaining_re_pull={remaining}')
+    return 0 if state['complete'] else 1
+
+
+def execute_parallel_sites(session, base_url, state, sites, log, deadline, *, max_parallel=2):
+    """Crawl two marketplaces in one job, then reconcile each site's result alone."""
+    state.setdefault('waiting_auth_browser', {})
+    active_sites = [site for site in sites if state['scopes'][site]]
+    for site in sites:
+        if not state['scopes'][site]:
+            state['results'][site] = dict(status='empty', complete=True, remaining=0)
+
+    for start in range(0, len(active_sites), max_parallel):
+        batch = active_sites[start:start + max_parallel]
+        ensure_same_day(state)
+        if stopped(state):
+            state.update(status='paused', current_site=None, current_sites=[], current_job=None)
+            save_state(state)
+            return 1
+        if time.monotonic() >= deadline:
+            raise TimeoutError('批次时间预算已用完，未启动下一站')
+        if len(batch) == 1:
+            if execute(session, base_url, state, batch, log, deadline, finalize=False):
+                return 1
+            continue
+
+        browser = 'chrome'
+        for site in batch:
+            try:
+                if page_status(session, site) == 'authentication_required':
+                    log(f'AUTH_REQUIRED_IN_CHROME site={site} name={SITE_NAMES[site]}，本组改用 Edge')
+            except Exception as exc:
+                browser = 'edge'
+                log(f'CHROME_PREFLIGHT_ERROR site={site} name={SITE_NAMES[site]} error={exc}; 本组改用 Edge')
+
+        ids = [int(target_id) for site in batch for target_id in state['scopes'][site]]
+        state.update(status='running', current_site=batch[0], current_sites=list(batch), current_job=None)
+        save_state(state)
+        options = dict(browser=browser, data_ids=ids, count_day=state['count_day'],
+                       compensation_browser=browser)
+        if browser == 'chrome':
+            options['debugger_addresses'] = {site: debugger_address(site) for site in batch}
+        payload = compensation_browser_options(options, browser=browser)
+        payload.update(workers=2, skip_deal=True,
+                       exclude_activity=bool(state.get('exclude_activity', False)),
+                       resume=not bool(state.get('force_refresh', False)),
+                       auto_compensate=True, compensation_rounds=2, pause_on_auth=True,
+                       parallel_sites=2, **{'async': True})
+        response = session.post(base_url + '/crawl', json=payload, timeout=20)
+        response.raise_for_status()
+        body = response.json()
+        if not body.get('success') or not body.get('job', {}).get('id'):
+            raise ValueError('双站任务提交结果不明确，停止批次以避免重复提交')
+        job_id = body['job']['id']
+        state['current_job'] = job_id
+        save_state(state)
+        job = wait_job(session, base_url, job_id, state, deadline)
+        auth_pause = (job['status'] == 'paused'
+                      and job.get('pause_reason') == 'authentication_required')
+        if stopped(state):
+            state.update(status='paused')
+            save_state(state)
+            log(f'paused sites={",".join(batch)} job={job_id} status={job["status"]}')
+            return 1
+        if job['status'] != 'finished' and not auth_pause:
+            log(f'parallel_sites_fallback sites={",".join(batch)} job={job_id} status={job["status"]}')
+        elif auth_pause:
+            log(f'AUTH_REQUIRED_IN_PARALLEL sites={",".join(batch)} site={job.get("authentication_site")}; resuming each site independently')
+
+        # The paired pass may stop both workers on one challenge. Resume each
+        # site's incomplete targets separately to preserve auth isolation.
+        for site in batch:
+            if execute(session, base_url, state, [site], log, deadline,
+                       finalize=False, resume_completed=True):
+                return 1
+
+    if stopped(state):
+        state.update(status='paused', current_site=None, current_sites=[], current_job=None)
+        save_state(state)
+        return 1
+    state.update(status='waiting_auth' if state['waiting_auth'] else 'finished',
+                 current_site=None, current_sites=[], current_job=None,
+                 complete=all(r.get('complete', False) for r in state['results'].values()))
+    save_state(state)
+    unknown = any(not r.get('complete') and r.get('remaining') is None
+                  for r in state['results'].values())
     remaining = 'unknown' if unknown else sum(r.get('remaining') or 0 for r in state['results'].values())
     log(f'finish complete={state["complete"]} waiting_auth={state["waiting_auth"]} remaining_re_pull={remaining}')
     return 0 if state['complete'] else 1
@@ -263,7 +361,8 @@ def run(log, api_url, timeout_seconds, resume_auth=False):
             scopes = load_scopes()
             state = dict(run_id=datetime.now().astimezone().isoformat(), pid=os.getpid(),
                          count_day=date.today().isoformat(), status='preparing', order=list(ORDER),
-                         scopes=scopes, results={}, waiting_auth=[], complete=False)
+                         scopes=scopes, results={}, waiting_auth=[], complete=False,
+                         exclude_activity=False)
             sites = list(ORDER)
         latest = session.get(api_url.rsplit('/', 1)[0] + '/jobs/latest', timeout=20)
         latest.raise_for_status()
@@ -275,7 +374,8 @@ def run(log, api_url, timeout_seconds, resume_auth=False):
         state.pop('error', None)
         state['complete'] = False
         owns_state = True
-        return execute(session, api_url.rsplit('/', 1)[0], state, sites, log, time.monotonic() + timeout_seconds)
+        return execute(session, api_url.rsplit('/', 1)[0], state, sites, log,
+                       time.monotonic() + timeout_seconds, parallel_sites=2)
     except Exception as exc:
         if state and owns_state:
             state.update(status='failed', complete=False, error=str(exc))

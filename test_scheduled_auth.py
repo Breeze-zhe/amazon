@@ -49,7 +49,92 @@ class ScheduledAuthTests(unittest.TestCase):
         self.assertEqual(batch['status'], 'finished')
         self.assertTrue(batch['complete'])
         self.assertEqual(code, 0)
+        self.assertTrue(all(not c.kwargs['json']['exclude_activity'] for c in session.post.call_args_list))
         self.assertTrue(any('AUTH_REQUIRED_IN_CHROME' in c.args[0] for c in log.call_args_list))
+
+    def test_parallel_batch_uses_two_site_browsers_and_reconciles_without_force_refresh(self):
+        batch = state()
+        batch['force_refresh'] = True
+        session, log = Mock(), Mock()
+        session.post.return_value.json.return_value = dict(success=True, job=dict(id='job'))
+        with patch.object(r, 'save_state'), patch.object(r, 'stopped', return_value=False), \
+             patch.object(r, 'page_status', return_value='ready'), \
+             patch.object(r, 'wait_job', side_effect=[job(), job(), job(), job()]):
+            code = r.execute_parallel_sites(
+                session, 'http://local/api', batch, ['J', 'A', 'U'], log,
+                time.monotonic()+100,
+            )
+
+        payloads = [call.kwargs['json'] for call in session.post.call_args_list]
+        self.assertEqual(code, 0)
+        self.assertEqual(payloads[0]['data_ids'], [174, 158])
+        self.assertEqual(payloads[0]['workers'], 2)
+        self.assertEqual(payloads[0]['parallel_sites'], 2)
+        self.assertFalse(payloads[0]['resume'])
+        self.assertEqual(payloads[0]['debugger_addresses'], {
+            'J': '127.0.0.1:9230', 'A': '127.0.0.1:9231',
+        })
+        self.assertEqual([payload['data_ids'] for payload in payloads[1:]], [[174], [158], [101]])
+        self.assertEqual([payload['resume'] for payload in payloads[1:]], [True, True, False])
+        self.assertEqual(batch['status'], 'finished')
+        self.assertTrue(batch['complete'])
+
+    def test_incomplete_site_does_not_stop_later_sites_in_parallel_batch(self):
+        batch = state()
+        session, log = Mock(), Mock()
+        session.post.return_value.json.return_value = dict(success=True, job=dict(id='job'))
+        with patch.object(r, 'save_state'), patch.object(r, 'stopped', return_value=False), \
+             patch.object(r, 'page_status', return_value='ready'), \
+             patch.object(r, 'wait_job', side_effect=[
+                 job('failed', False), job(complete=False), job(), job(),
+             ]):
+            code = r.execute_parallel_sites(
+                session, 'http://local/api', batch, ['J', 'A', 'U'], log,
+                time.monotonic()+100,
+            )
+
+        payloads = [call.kwargs['json'] for call in session.post.call_args_list]
+        self.assertEqual(len(payloads), 4)
+        self.assertEqual([payload['data_ids'] for payload in payloads[1:]], [[174], [158], [101]])
+        self.assertFalse(batch['results']['J']['complete'])
+        self.assertTrue(batch['results']['A']['complete'])
+        self.assertTrue(batch['results']['U']['complete'])
+        self.assertEqual(batch['status'], 'finished')
+        self.assertFalse(batch['complete'])
+        self.assertEqual(code, 1)
+
+    def test_parallel_auth_pause_resumes_sites_independently(self):
+        batch = state()
+        session, log = Mock(), Mock()
+        session.post.return_value.json.return_value = dict(success=True, job=dict(id='job'))
+        with patch.object(r, 'save_state'), patch.object(r, 'stopped', return_value=False), \
+             patch.object(r, 'page_status', side_effect=['ready', 'ready', 'authentication_required', 'ready']), \
+             patch.object(r, 'wait_job', side_effect=[
+                 job('paused', False, pause_reason='authentication_required'),
+                 job('paused', False, pause_reason='authentication_required'),
+                 job(),
+             ]):
+            code = r.execute_parallel_sites(
+                session, 'http://local/api', batch, ['J', 'A'], log,
+                time.monotonic()+100,
+            )
+
+        payloads = [call.kwargs['json'] for call in session.post.call_args_list]
+        self.assertEqual(code, 1)
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(payloads[0]['browser'], 'chrome')
+        self.assertEqual(payloads[0]['debugger_addresses'], {
+            'J': '127.0.0.1:9230', 'A': '127.0.0.1:9231',
+        })
+        self.assertEqual(payloads[1]['data_ids'], [174])
+        self.assertEqual(payloads[1]['browser'], 'edge')
+        self.assertNotIn('debugger_address', payloads[1])
+        self.assertEqual(payloads[2]['data_ids'], [158])
+        self.assertEqual(payloads[2]['browser'], 'chrome')
+        self.assertEqual(batch['waiting_auth'], ['J'])
+        self.assertEqual(batch['waiting_auth_browser'], {'J': 'edge'})
+        self.assertTrue(batch['results']['A']['complete'])
+        self.assertEqual(batch['status'], 'waiting_auth')
 
     def test_mid_crawl_auth_pauses_only_current_site(self):
         batch, session, code, _, _, _ = self.execute(['ready']*3, [
@@ -158,18 +243,29 @@ class ScheduledAuthTests(unittest.TestCase):
 
     def test_payload_retains_quality_and_only_resumes_incomplete(self):
         p = r.payload_for('J', [174], date.today().isoformat())
-        for key in ('resume', 'pause_on_auth', 'exclude_activity', 'skip_deal', 'auto_compensate', 'selenium_only'):
+        for key in ('resume', 'pause_on_auth', 'skip_deal', 'auto_compensate', 'selenium_only'):
             self.assertTrue(p[key], key)
+        self.assertFalse(p['exclude_activity'])
         self.assertEqual((p['browser'], p['workers'], p['compensation_rounds']), ('chrome', 1, 2))
         self.assertEqual(p['debugger_address'], '127.0.0.1:9230')
 
     def test_payload_can_force_refresh_without_activity_filter_but_still_skip_deal(self):
         p = r.payload_for('J', [174], date.today().isoformat(), resume=False,
-                          exclude_activity=False, skip_broken_links=True)
+                          exclude_activity=False)
         self.assertFalse(p['resume'])
         self.assertFalse(p['exclude_activity'])
         self.assertTrue(p['skip_deal'])
-        self.assertTrue(p['skip_broken_links'])
+        self.assertNotIn('skip_broken_links', p)
+
+    def test_load_scopes_includes_products_in_advertising_campaigns(self):
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        with patch.object(web_app, 'connect', return_value=connection), \
+             patch.object(web_app, 'database_config', return_value={}), \
+             patch.object(web_app, 'fetch_targets', return_value=[{'id': 174, 'country': 'J'}]) as fetch:
+            scopes = r.load_scopes()
+        fetch.assert_called_once_with(connection, exclude_activity=False)
+        self.assertEqual(scopes['J'], [174])
 
     def test_old_day_and_manual_pause_cannot_resume_auth(self):
         for status, day in [('paused', date.today()), ('waiting_auth', date.today()-timedelta(days=1))]:
@@ -322,13 +418,26 @@ class BrowserTests(unittest.TestCase):
         self.assertTrue(crawler.is_blocked_html('<h1>Click the button below to continue shopping</h1><button>Continue shopping</button>'))
         self.assertFalse(crawler.is_blocked_html('<div id="productTitle">Click the button below to continue shopping</div>'))
 
-    def test_wrong_marketplace_tab_rejected_before_cdp(self):
-        session = Mock()
-        session.get.return_value.json.return_value = [dict(type='page', url='https://www.amazon.com/')]
-        with patch.object(browsers.websocket, 'create_connection') as connect:
-            with self.assertRaisesRegex(RuntimeError, 'matching marketplace'):
-                browsers.page_status(session, 'J')
-        connect.assert_not_called()
+    def test_wrong_marketplace_tab_is_repaired(self):
+        session, ws = Mock(), Mock()
+        session.get.return_value.json.return_value = [dict(
+            type='page', url='https://www.amazon.com/', webSocketDebuggerUrl='ws://localhost/tab')]
+        values = [
+            dict(id=1, result=dict(result=dict(value=dict(
+                html='<html><body>Home</body></html>', url='https://www.amazon.com/',
+                ready='complete', text='Home')))),
+            dict(id=100, result={}),
+            dict(id=2, result=dict(result=dict(value=dict(
+                html='<html><body>Home</body></html>', url='https://www.amazon.co.jp/',
+                ready='complete', text='Home')))),
+        ]
+        ws.recv.side_effect = [json.dumps(value) for value in values]
+        with patch.object(browsers.websocket, 'create_connection', return_value=ws):
+            self.assertEqual(browsers.page_status(session, 'J'), 'ready')
+        commands = [json.loads(call.args[0]) for call in ws.send.call_args_list]
+        navigation = next(command for command in commands if command['method'] == 'Page.navigate')
+        self.assertEqual(navigation['params']['url'], 'https://www.amazon.co.jp/')
+        ws.close.assert_called_once()
 
     def test_challenge_is_read_only_no_navigation_or_solving(self):
         session, ws = Mock(), Mock()

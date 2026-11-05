@@ -2313,7 +2313,6 @@ def fetch_targets(
     asin_country: str | None = None,
     limit: int | None = None,
     exclude_activity: bool = False,
-    exclude_broken_links: bool = False,
 ) -> list[dict[str, Any]]:
     sql = [
         "SELECT id, asin, country, asin_country, name",
@@ -2321,9 +2320,6 @@ def fetch_targets(
     ]
     where_parts: list[str] = ["status = 1"]
     params: list[Any] = []
-    if exclude_broken_links:
-        where_parts.append("COALESCE(label, '') <> %s")
-        params.append('链接挂了')
 
     if data_id is not None:
         where_parts.append("id = %s")
@@ -2339,7 +2335,6 @@ def fetch_targets(
         params.append(asin_country)
     if exclude_activity:
         where_parts.extend([
-            "TRIM(COALESCE(ad_activity, '')) IN ('', '未开启', '否', '0')",
             "TRIM(COALESCE(deal, '')) IN ('', '未开启', '否', '0')",
             "TRIM(COALESCE(deal_date, '')) = ''",
             "TRIM(COALESCE(deal_end_date, '')) = ''",
@@ -2356,32 +2351,6 @@ def fetch_targets(
     with connection.cursor() as cursor:
         cursor.execute(full_sql, params)
         return list(cursor.fetchall())
-
-
-def mark_product_link_unavailable(connection, data_id: int, asin: str, country_code: str) -> bool:
-    """Tag only the exact active marketplace row verified as a missing page."""
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "UPDATE `amazon_data` SET `label` = %s "
-            "WHERE `id` = %s AND UPPER(`asin`) = UPPER(%s) AND `country` = %s AND `status` = 1",
-            ('链接挂了', int(data_id), str(asin), str(country_code)),
-        )
-        changed = cursor.rowcount == 1
-    if changed:
-        connection.commit()
-    return changed
-
-
-def fetch_product_link_unavailable_ids(connection, data_ids: list[int]) -> set[int]:
-    if not data_ids:
-        return set()
-    placeholders = ', '.join(['%s'] * len(data_ids))
-    with connection.cursor() as cursor:
-        cursor.execute(
-            f"SELECT id FROM `amazon_data` WHERE `id` IN ({placeholders}) AND `label` = %s",
-            [*map(int, data_ids), '链接挂了'],
-        )
-        return {int(row['id']) for row in cursor.fetchall()}
 
 
 def fetch_completed_day_ids(connection, count_day: date, data_ids: list[int]) -> set[int]:
@@ -2415,7 +2384,7 @@ def fetch_completed_day_ids(connection, count_day: date, data_ids: list[int]) ->
         if CrawlMetric(**{key: row.get(key) for key in ("buy_box", "price", "star", "reviews", "bsr")}).is_complete()
         and (str(row["buy_box"]) == "0" or price_matches_site(str(row["price"]), countries.get(int(row["data_id"]), "U")))
     }
-    return completed | fetch_product_link_unavailable_ids(connection, data_ids)
+    return completed
 
 
 def fetch_existing_day_id(connection, data_id: int, count_day: date) -> int | None:
@@ -2585,12 +2554,10 @@ def crawl_amazon_day_data(
     profile_key: str | None = None,
     count_day: date | None = None,
     exclude_activity: bool = False,
-    exclude_broken_links: bool = False,
 ) -> dict[str, Any]:
     ensure_re_pull_column(connection)
     targets = fetch_targets(connection, data_id=data_id, data_ids=data_ids, asin_country=asin_country,
-                            limit=limit, exclude_activity=exclude_activity,
-                            exclude_broken_links=exclude_broken_links)
+                            limit=limit, exclude_activity=exclude_activity)
     # Keep one marketplace together so the shared browser can reuse its
     # verified delivery location and currency settings across adjacent items.
     targets.sort(key=lambda target: (str(target.get("country") or "U"), int(target["id"])))
@@ -2729,10 +2696,6 @@ def crawl_amazon_day_data(
                     is_product_link_unavailable_message(attempt.message)
                     for attempt in record.attempts
                 )
-                if link_unavailable:
-                    mark_product_link_unavailable(
-                        connection, record.data_id, record.asin, record.country_code,
-                    )
                 action = upsert_day_record(
                     connection,
                     record.data_id,

@@ -27,12 +27,12 @@ class ImporterRestoreTests(unittest.TestCase):
         self.assertEqual(mapping["custom_alias"], "自定义列")
         self.assertEqual(unmapped, [])
 
-    def test_date_label_and_source_text_normalization(self):
+    def test_date_and_source_text_normalization(self):
         self.assertEqual(importer.normalize_db_value("select_date", "2026/10/13"), "2026-10-13")
-        self.assertEqual(importer.normalize_db_value("label", " 新品链接 "), "新品链接")
-        self.assertIsNone(importer.normalize_db_value("label", "未知标签"))
         self.assertEqual(importer.normalize_db_value("deal_date", "待定"), "待定")
         self.assertEqual(importer.normalize_db_value("senior_a", " 已完成 "), "已完成")
+        self.assertNotIn("label", importer.EXPLICIT_HEADER_TO_COLUMN.values())
+        self.assertNotIn("ad_activity", importer.EXPLICIT_HEADER_TO_COLUMN.values())
 
     def test_source_lifecycle_fields_do_not_override_active_defaults(self):
         frame = pd.DataFrame([{

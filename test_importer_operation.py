@@ -29,7 +29,6 @@ class BasicInfoCursor:
             return {
                 "senior_a_missing": 0,
                 "deal_active": 0,
-                "ad_inactive": 0,
                 "title_unmodified": 0,
             }
         return {"total": 1}

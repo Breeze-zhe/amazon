@@ -32,7 +32,6 @@ class RecordingCursor:
         return {
             "senior_a_missing": 0,
             "deal_active": 0,
-            "ad_inactive": 0,
             "title_unmodified": 0,
             "pending_order": 0,
             "adjustment_amount": 0,

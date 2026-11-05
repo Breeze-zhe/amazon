@@ -58,19 +58,20 @@ class BrokenPageDetectionTests(unittest.TestCase):
         requests.assert_not_called()
         curl.assert_not_called()
 
-    def test_target_filter_only_excludes_explicit_broken_link_label(self):
+    def test_target_filter_uses_only_existing_activity_fields(self):
         connection = Mock()
         connection.cursor.return_value.__enter__ = Mock()
         connection.cursor.return_value.__exit__ = Mock(return_value=False)
         cursor = connection.cursor.return_value.__enter__.return_value
         cursor.fetchall.return_value = []
-        c.fetch_targets(connection, data_ids=[1], exclude_broken_links=True, exclude_activity=True)
+        c.fetch_targets(connection, data_ids=[1], exclude_activity=True)
         query, params = cursor.execute.call_args.args
-        self.assertIn("COALESCE(label, '') <> %s", query)
-        self.assertIn('链接挂了', params)
+        self.assertNotIn("label", query)
+        self.assertNotIn("ad_activity", query)
         self.assertIn("TRIM(COALESCE(deal, ''))", query)
+        self.assertEqual(params, [1])
 
-    def test_unavailable_item_is_tagged_and_next_target_continues(self):
+    def test_unavailable_item_is_recorded_for_this_run_and_next_target_continues(self):
         first = {'id': 1008, 'asin':'B0G7CP744Q', 'asin_country':'B0G7CP744Q美国','country':'U','name':'标签打印机'}
         second = {'id': 1009, 'asin':'B0EXAMPLE01', 'asin_country':'B0EXAMPLE01美国','country':'U','name':'下一个商品'}
         db = Mock()
@@ -78,7 +79,6 @@ class BrokenPageDetectionTests(unittest.TestCase):
         db.__exit__ = Mock(return_value=False)
         db.cursor.return_value.__enter__ = Mock(return_value=db.cursor.return_value)
         db.cursor.return_value.__exit__ = Mock(return_value=False)
-        db.cursor.return_value.rowcount = 1
         metric = c.CrawlMetric(buy_box=1, price='$12.00', star='4', reviews='1', bsr='1', offer_verified=True)
         with patch.dict('os.environ', {'AMAZON_ENABLE_SELENIUM':'0'}), \
              patch.object(c, 'ensure_re_pull_column'), patch.object(c, 'fetch_targets', return_value=[first, second]), \
@@ -95,24 +95,30 @@ class BrokenPageDetectionTests(unittest.TestCase):
         self.assertEqual(result['items'][0]['error'], c.LINK_UNAVAILABLE_MESSAGE)
         self.assertEqual(result['stats']['link_unavailable'], 1)
         self.assertEqual(result['items'][1]['asin'], 'B0EXAMPLE01')
-        db.cursor.return_value.execute.assert_any_call(
-            'UPDATE `amazon_data` SET `label` = %s WHERE `id` = %s AND UPPER(`asin`) = UPPER(%s) AND `country` = %s AND `status` = 1',
-            ('链接挂了',1008,'B0G7CP744Q','U'))
+        self.assertFalse(any(
+            "UPDATE `amazon_data`" in str(call.args[0])
+            for call in db.cursor.return_value.execute.call_args_list
+        ))
         self.assertEqual(diagnostic.call_count, 2)
 
-    def test_unavailable_ids_are_treated_as_handled_on_same_day_resume(self):
+    def test_unavailable_items_are_not_persisted_as_cross_run_skip_state(self):
         connection = Mock()
         cursor = Mock()
         cursor.__enter__ = Mock(return_value=cursor)
         cursor.__exit__ = Mock(return_value=False)
         cursor.fetchall.return_value = []
         connection.cursor.return_value = cursor
-        with patch.object(c, 'fetch_product_link_unavailable_ids', return_value={1008}):
-            self.assertEqual(c.fetch_completed_day_ids(connection, date.today(), [1008,1009]), {1008})
+        self.assertEqual(c.fetch_completed_day_ids(connection, date.today(), [1008,1009]), set())
+        self.assertFalse(any("amazon_data" in str(call.args[0]) and "label" in str(call.args[0])
+                             for call in cursor.execute.call_args_list))
 
-    def test_label_is_allowed_through_existing_edit_api(self):
-        self.assertIn('链接挂了', importer.LABEL_VALUES)
-        self.assertEqual(web_app.normalize_edit_payload({'label':'链接挂了'}), {'label':'链接挂了'})
+    def test_removed_label_field_is_not_imported_or_editable(self):
+        mapping, _ = importer.build_column_mapping(
+            ["ASIN", "简称", "label", "标签", "广告活动"], ["asin", "country"])
+        self.assertNotIn("label", mapping)
+        self.assertNotIn("ad_activity", mapping)
+        with self.assertRaises(ValueError):
+            web_app.normalize_edit_payload({"label": "链接挂了"})
 
 
 if __name__ == '__main__':

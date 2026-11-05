@@ -21,7 +21,6 @@ const app = createApp({
                 attention_count: 0,
                 senior_a_missing: 0,
                 deal_active: 0,
-                ad_inactive: 0,
                 title_unmodified: 0,
                 todo_pending: 0,
                 pending_order: 0,
@@ -42,9 +41,9 @@ const app = createApp({
             basicSummary: {
                 senior_a_missing: 0,
                 deal_active: 0,
-                ad_inactive: 0,
                 title_unmodified: 0,
             },
+            statusTagGroups: {},
             dayRows: [],
             daySearch: "",
             dayOperation: "",
@@ -67,6 +66,25 @@ const app = createApp({
                 missing: 0,
                 comparison_available: 0,
             },
+            orderRows: [],
+            orderDates: [],
+            orderLatestDay: null,
+            orderAsin: "",
+            orderOperation: "未央",
+            orderSite: "",
+            orderOperations: [],
+            orderSites: [],
+            orderPage: 1,
+            orderPageSize: 50,
+            orderTotal: 0,
+            orderTotalPages: 1,
+            orderLoading: false,
+            orderImporting: false,
+            orderError: "",
+            orderImportMessage: "",
+            orderImportError: false,
+            orderRequestId: 0,
+            orderSearchTimer: null,
             stockRows: [],
             stockSearch: "",
             stockDate: "",
@@ -94,6 +112,25 @@ const app = createApp({
             settingsPageSize: 50,
             settingsTotalPages: 1,
             settingsSearch: "",
+            productOperationRows: [],
+            productOperationTotal: 0,
+            productOperationPage: 1,
+            productOperationPageSize: 50,
+            productOperationTotalPages: 1,
+            productOperationSearch: "",
+            productOperationTypeFilter: "",
+            productOperationTypes: [],
+            productOperationProducts: [],
+            productOperationProductSearch: "",
+            productOperationProductOpen: false,
+            productOperationProductIndex: -1,
+            productOperationLoading: false,
+            productOperationError: "",
+            productOperationFormOpen: false,
+            productOperationEditingId: null,
+            productOperationSaving: false,
+            productOperationSaveError: "",
+            productOperationForm: { asin_country: "", tag_id: "", remark: "", operate_date: todayString() },
             settingsLoading: false,
             settingsErrorMessage: "",
             tagGroupFormOpen: false,
@@ -136,6 +173,14 @@ const app = createApp({
             errorMessage: "",
             toastMessage: "",
             detailRow: null,
+            orderChartRow: null,
+            orderChartStart: "",
+            orderChartEnd: "",
+            orderChartResult: null,
+            orderChartLoading: false,
+            orderChartError: "",
+            orderChartRequestId: 0,
+            orderChartTrigger: null,
             detailColumns: [],
             detailIsDayData: false,
             detailIsStockData: false,
@@ -164,7 +209,10 @@ const app = createApp({
                 { key: "todo-list", label: "待办事项", icon: "✓" },
                 { key: "day-data", label: "日数据跟进", icon: "D" },
                 { key: "stock-data", label: "库存跟进", icon: "K" },
+                { key: "order-data", label: "订单列表", icon: "O" },
                 { key: "ad-activity", label: "广告活动", icon: "A" },
+                { key: "operation-logs", label: "操作日志", icon: "◷" },
+                { key: "product-operation-logs", label: "商品操作日志", icon: "▤" },
                 { key: "base-settings", label: "基础设置", icon: "⚙", children: [
                     { key: "tag-groups", label: "标签组" },
                     { key: "tags", label: "标签" },
@@ -177,7 +225,6 @@ const app = createApp({
                     cards: [
                         { key: "senior_a_missing", label: "A+未创作", hint: "A+ 字段为无", view: "basic-info", metric: "senior_a_missing" },
                         { key: "deal_active", label: "活动开启", hint: "活动状态为开启", view: "basic-info", metric: "deal_active" },
-                        { key: "ad_inactive", label: "广告未开启", hint: "广告活动为未开启", view: "basic-info", metric: "ad_inactive" },
                         { key: "title_unmodified", label: "标题未修改", hint: "标题状态为未修改", view: "basic-info", metric: "title_unmodified" },
                     ],
                 },
@@ -217,23 +264,19 @@ const app = createApp({
                 { key: "operation", label: "运营" },
                 { key: "picture", label: "图床" },
                 { key: "asin", label: "ASIN" },
-                { key: "link", label: "链接" },
-                { key: "label", label: "标签" },
+                { key: "link", label: "商品链接" },
                 { key: "country_name", label: "国家" },
-                { key: "title", label: "标题" },
-                { key: "point", label: "五点" },
-                { key: "senior_a", label: "A+" },
-                { key: "ad_activity", label: "广告活动" },
+                { key: "product_status", label: "产品状态" },
+                { key: "inventory_status", label: "库存状态" },
+                { key: "ad_status", label: "广告状态" },
+                { key: "promotion_status", label: "促销状态" },
                 { key: "deal_date", label: "活动开始日期" },
                 { key: "deal_end_date", label: "活动结束日期" },
                 { key: "stock_remark", label: "库存备注" },
-                { key: "status", label: "Status" },
-                { key: "remark", label: "销售建议" },
             ],
             basicMetricCards: [
                 { key: "senior_a_missing", label: "A+未创作", hint: "A+ 字段为无" },
                 { key: "deal_active", label: "活动开启", hint: "活动状态为开启" },
-                { key: "ad_inactive", label: "广告未开启", hint: "广告活动为未开启" },
                 { key: "title_unmodified", label: "标题未修改", hint: "标题状态为未修改" },
             ],
             basicDetailColumns: [
@@ -245,6 +288,10 @@ const app = createApp({
                 { key: "seller_sku", label: "Seller SKU" },
                 { key: "country", label: "国家简称" },
                 { key: "country_name", label: "国家" },
+                { key: "product_status", label: "产品状态" },
+                { key: "inventory_status", label: "库存状态" },
+                { key: "ad_status", label: "广告状态" },
+                { key: "promotion_status", label: "促销状态" },
                 { key: "title", label: "标题" },
                 { key: "point", label: "五点" },
                 { key: "senior_a", label: "A+" },
@@ -253,13 +300,11 @@ const app = createApp({
                 { key: "obsolete_date", label: "淘汰日期" },
                 { key: "status", label: "Status" },
                 { key: "remark", label: "销售建议" },
-                { key: "ad_activity", label: "广告活动" },
                 { key: "deal", label: "活动" },
                 { key: "deal_date", label: "活动开始日期" },
                 { key: "deal_end_date", label: "活动结束日期" },
                 { key: "asin_country", label: "ASIN+国家" },
                 { key: "link", label: "链接" },
-                { key: "label", label: "标签" },
                 { key: "stock_remark", label: "库存备注" },
             ],
             editReadonlyFields: [
@@ -273,6 +318,10 @@ const app = createApp({
                 { key: "name", label: "产品", type: "text", maxlength: 255 },
                 { key: "seller_sku", label: "Seller SKU", type: "text", maxlength: 50 },
                 { key: "country_name", label: "国家", type: "text", maxlength: 50 },
+                { key: "product_status", label: "产品状态", type: "tag-select", options: [] },
+                { key: "inventory_status", label: "库存状态", type: "tag-select", options: [] },
+                { key: "ad_status", label: "广告状态", type: "tag-select", options: [] },
+                { key: "promotion_status", label: "促销状态", type: "tag-select", options: [] },
                 { key: "group", label: "小组", type: "text", maxlength: 20 },
                 { key: "select_date", label: "接手日期", type: "date" },
                 { key: "obsolete_date", label: "淘汰日期", type: "date" },
@@ -288,18 +337,9 @@ const app = createApp({
                 { key: "title", label: "标题", type: "text", maxlength: 100 },
                 { key: "point", label: "五点", type: "text", maxlength: 100 },
                 { key: "senior_a", label: "A+", type: "text", maxlength: 100 },
-                { key: "ad_activity", label: "广告活动", type: "text", maxlength: 255 },
                 { key: "deal", label: "活动", type: "text", maxlength: 100 },
                 { key: "deal_date", label: "活动开始日期", type: "text", maxlength: 100 },
                 { key: "deal_end_date", label: "活动结束日期", type: "text", maxlength: 100 },
-                { key: "label", label: "标签", type: "select", options: [
-                    { value: "", label: "正常" },
-                    { value: "新品链接", label: "新品链接" },
-                    { value: "动销活动", label: "动销活动" },
-                    { value: "清仓", label: "清仓" },
-                    { value: "链接异常", label: "链接异常" },
-                    { value: "链接挂了", label: "链接挂了" },
-                ] },
                 { key: "remark", label: "销售建议", type: "textarea", maxlength: 255 },
                 { key: "stock_remark", label: "库存备注", type: "textarea", maxlength: 1000 },
             ],
@@ -369,6 +409,32 @@ const app = createApp({
         };
     },
     computed: {
+        filteredProductOperationProducts() {
+            const selected = this.productOperationProducts.find((product) => product.asin_country === this.productOperationForm.asin_country);
+            const query = selected && this.productOperationProductSearch === this.productOperationProductLabel(selected)
+                ? "" : this.productOperationProductSearch.trim().toLocaleLowerCase();
+            return this.productOperationProducts.filter((product) =>
+                [product.name, product.asin, product.country_name].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+        },
+        orderChartGeometry() {
+            const points = this.orderChartResult?.points || [];
+            const maximum = points.reduce((value, point) => Math.max(value, point.quantity), 0);
+            const rawStep = Math.max(1, maximum / 4);
+            const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+            const step = [1, 2, 5, 10].find((value) => value * magnitude >= rawStep) * magnitude;
+            const width = Math.max(880, 80 + points.length * 32);
+            const spacing = (width - 80) / Math.max(1, points.length);
+            return {
+                width,
+                ticks: Array.from({ length: 5 }, (_, i) => ({ value: i * step, y: 260 - i * 55 })),
+                bars: points.map((point, index) => ({
+                    ...point, x: 56 + (index + 0.5) * spacing,
+                    y: 260 - point.quantity / (4 * step) * 220,
+                    height: point.quantity / (4 * step) * 220,
+                    width: Math.min(24, spacing * 0.65),
+                })),
+            };
+        },
         currentMenu() {
             return this.menuItems.find((item) => item.key === this.activeView) || this.menuItems[0];
         },
@@ -379,12 +445,14 @@ const app = createApp({
                 "todo-list": "待办事项",
                 "day-data": "日数据跟进",
                 "stock-data": "库存跟进",
+                "order-data": "订单列表",
             };
             return titles[this.activeView] || "敬请期待";
         },
     },
     mounted() {
         this.loadOverview();
+        this.loadStatusTagOptions();
         this.pollCrawlJob();
         this.pollScheduledBatch();
         document.addEventListener("keydown", this.handleKeydown);
@@ -396,11 +464,67 @@ const app = createApp({
         window.clearTimeout(this.searchTimer);
         window.clearTimeout(this.daySearchTimer);
         window.clearTimeout(this.stockSearchTimer);
+        window.clearTimeout(this.orderSearchTimer);
         window.clearTimeout(this.toastTimer);
         window.clearTimeout(this.crawlJobTimer);
         window.clearTimeout(this.scheduledTimer);
     },
     methods: {
+        async openOrderChart(row) {
+            this.orderChartTrigger = document.activeElement;
+            this.orderChartRow = row;
+            this.orderChartStart = "";
+            this.orderChartEnd = "";
+            this.orderChartResult = null;
+            this.orderChartError = "";
+            this.$nextTick(() => this.$refs.orderChartClose?.focus());
+            await this.loadOrderChart(true);
+        },
+        async loadOrderChart(useDefault = false) {
+            if (!this.orderChartRow) return;
+            const requestId = ++this.orderChartRequestId;
+            this.orderChartError = "";
+            if (!useDefault && (!this.orderChartStart || !this.orderChartEnd || this.orderChartStart > this.orderChartEnd)) {
+                this.orderChartError = "请选择有效的开始、结束日期，且开始日期不能晚于结束日期";
+                this.orderChartLoading = false;
+                return;
+            }
+            const key = this.orderChartRow.asin_country || (this.orderChartRow.asin && this.orderChartRow.country_name
+                ? `${this.orderChartRow.asin}${this.orderChartRow.country_name}` : "");
+            if (!key) {
+                this.orderChartError = "该商品缺少 ASIN 或国家，无法查询订单";
+                return;
+            }
+            this.orderChartLoading = true;
+            const params = new URLSearchParams({ asin_country: key });
+            if (!useDefault) {
+                params.set("start_date", this.orderChartStart);
+                params.set("end_date", this.orderChartEnd);
+            }
+            try {
+                const response = await fetch(`/api/order-data/history?${params}`);
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "订单数据加载失败");
+                if (requestId !== this.orderChartRequestId) return;
+                this.orderChartResult = result;
+                this.orderChartStart = result.start_date || "";
+                this.orderChartEnd = result.end_date || "";
+            } catch (error) {
+                if (requestId === this.orderChartRequestId) this.orderChartError = error.message;
+            } finally {
+                if (requestId === this.orderChartRequestId) this.orderChartLoading = false;
+            }
+        },
+        closeOrderChart() {
+            ++this.orderChartRequestId;
+            this.orderChartRow = null;
+            this.orderChartResult = null;
+            this.orderChartLoading = false;
+            this.orderChartError = "";
+            const trigger = this.orderChartTrigger;
+            this.orderChartTrigger = null;
+            this.$nextTick(() => { if (trigger?.isConnected) trigger.focus(); });
+        },
         formatStatus(value) {
             const normalized = String(value ?? "").trim();
             if (normalized === "1") {
@@ -441,15 +565,66 @@ const app = createApp({
             const labels = { "1": "低", "2": "普通", "3": "中", "4": "高", "5": "紧急" };
             return labels[String(value ?? "").trim()] || "未设置";
         },
-        labelClass(value) {
-            const normalized = String(value ?? "").trim();
-            const classes = {
-                "新品链接": "label-new",
-                "动销活动": "label-active",
-                "清仓": "label-clearance",
-                "链接异常": "label-error",
+        isStatusTagField(field) {
+            return ["product_status", "inventory_status", "ad_status", "promotion_status"].includes(this.fieldKey(field));
+        },
+        statusTagFor(row, field) {
+            const key = this.fieldKey(field);
+            const value = row && row[key];
+            if (value === null || value === undefined || String(value).trim() === "") return null;
+            const group = this.statusTagGroups[key];
+            const tag = (group?.tags || []).find((item) => String(item.id) === String(value));
+            return tag || { id: String(value), tag_name: `未知标签 #${value}`, color: "", status: 0 };
+        },
+        statusTagName(row, field) {
+            return this.statusTagFor(row, field)?.tag_name || "暂无";
+        },
+        statusTagClass(row, field) {
+            const tag = this.statusTagFor(row, field);
+            if (!tag) return "status-tag-empty";
+            const group = this.statusTagGroups[this.fieldKey(field)];
+            return Number(tag.status) === 1 && Number(group?.status) === 1 ? "" : "status-tag-disabled";
+        },
+        statusTagStyle(row, field) {
+            return this.tagColorStyle(this.statusTagFor(row, field)?.color);
+        },
+        tagColorStyle(value) {
+            const color = String(value || "").trim();
+            let rgb = null;
+            const rgbMatch = color.match(/^rgb\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i);
+            if (rgbMatch) rgb = rgbMatch.slice(1).map((part) => Math.min(255, Number(part)));
+            if (!rgb && /^#[0-9a-f]{6}$/i.test(color)) {
+                rgb = [1, 3, 5].map((start) => parseInt(color.slice(start, start + 2), 16));
+            }
+            if (!rgb) return {};
+            return {
+                color: `rgb(${rgb.join(",")})`,
+                borderColor: `rgb(${rgb.join(",")})`,
+                backgroundColor: `rgba(${rgb.join(",")}, 0.08)`,
             };
-            return classes[normalized] || "label-empty";
+        },
+        statusTagOptions(field) {
+            const key = this.fieldKey(field);
+            const group = this.statusTagGroups[key];
+            const currentId = String(this.detailForm[key] ?? "");
+            const enabled = Number(group?.status) === 1
+                ? (group.tags || []).filter((tag) => Number(tag.status) === 1).map((tag) => ({
+                    ...tag,
+                    value: String(tag.id),
+                    label: tag.tag_name,
+                }))
+                : [];
+            if (!currentId || enabled.some((tag) => tag.value === currentId)) return enabled;
+            const current = (group?.tags || []).find((tag) => String(tag.id) === currentId);
+            enabled.push({
+                ...(current || { id: currentId, tag_name: `未知标签 #${currentId}` }),
+                value: currentId,
+                label: current
+                    ? `${current.tag_name}（已停用，保留）`
+                    : `标签不可用（ID: ${currentId}，保留）`,
+                disabled: true,
+            });
+            return enabled;
         },
         handlePictureError(event) {
             const image = event.currentTarget;
@@ -458,9 +633,6 @@ const app = createApp({
             if (fallback) {
                 fallback.hidden = false;
             }
-        },
-        formatLabel(value) {
-            return String(value ?? "").trim() || "正常";
         },
         displayValue(value, fallback = "暂无") {
             const normalized = String(value ?? "").trim();
@@ -527,7 +699,6 @@ const app = createApp({
                 this.overviewSummary = {
                     senior_a_missing: basicData.summary?.senior_a_missing || 0,
                     deal_active: basicData.summary?.deal_active || 0,
-                    ad_inactive: basicData.summary?.ad_inactive || 0,
                     title_unmodified: basicData.summary?.title_unmodified || 0,
                     todo_pending: todoData.total || 0,
                     risk_count: dayData.summary?.risk_count || 0,
@@ -606,7 +777,6 @@ const app = createApp({
                 this.basicSummary = {
                     senior_a_missing: 0,
                     deal_active: 0,
-                    ad_inactive: 0,
                     title_unmodified: 0,
                     ...(result.summary || {}),
                 };
@@ -626,6 +796,19 @@ const app = createApp({
                 }
                 this.operationOptions = result.operations || [];
             } catch (error) {
+                this.showToast(error.message);
+            }
+        },
+        async loadStatusTagOptions() {
+            try {
+                const response = await fetch("/api/basic-info/status-tags");
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    throw new Error(result.message || "状态标签加载失败");
+                }
+                this.statusTagGroups = result.groups || {};
+            } catch (error) {
+                this.statusTagGroups = {};
                 this.showToast(error.message);
             }
         },
@@ -668,6 +851,100 @@ const app = createApp({
                 this.showToast(error.message);
             } finally {
                 this.dayLoading = false;
+            }
+        },
+        async loadOrderData() {
+            const requestId = ++this.orderRequestId;
+            this.orderLoading = true;
+            this.orderError = "";
+            const query = new URLSearchParams({
+                page: this.orderPage, page_size: this.orderPageSize,
+                operation: this.orderOperation, asin: this.orderAsin, country_name: this.orderSite,
+            });
+            try {
+                const response = await fetch(`/api/order-data?${query}`);
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "订单列表加载失败");
+                if (requestId !== this.orderRequestId) return;
+                this.orderRows = result.rows;
+                this.orderDates = result.dates;
+                this.orderLatestDay = result.latest_day;
+                this.orderTotal = result.total;
+                this.orderTotalPages = result.total_pages;
+            } catch (error) {
+                if (requestId === this.orderRequestId) this.orderError = error.message;
+            } finally {
+                if (requestId === this.orderRequestId) this.orderLoading = false;
+            }
+        },
+        orderOperationTooltip(operations) {
+            return (operations || []).map((item) => `${item.operation_type}：${item.remark}`).join("\n");
+        },
+        async loadOrderFilters() {
+            try {
+                const response = await fetch("/api/order-data/filters");
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "订单筛选项加载失败");
+                this.orderOperations = result.operations;
+                this.orderSites = result.sites;
+            } catch (error) {
+                this.showToast(error.message);
+            }
+        },
+        filterOrders() {
+            window.clearTimeout(this.orderSearchTimer);
+            this.orderPage = 1;
+            this.loadOrderData();
+        },
+        scheduleOrderSearch() {
+            window.clearTimeout(this.orderSearchTimer);
+            // Invalidate an older response while the new search is debounced.
+            ++this.orderRequestId;
+            this.orderSearchTimer = window.setTimeout(() => this.filterOrders(), 300);
+        },
+        clearOrderFilters() {
+            this.orderAsin = "";
+            this.orderOperation = "";
+            this.orderSite = "";
+            this.filterOrders();
+        },
+        triggerOrderImport() {
+            if (this.orderImporting) return;
+            const input = this.$refs.orderImportInput;
+            if (input) {
+                input.value = "";
+                input.click();
+            }
+        },
+        async importOrderData(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file || this.orderImporting) return;
+            this.orderImportMessage = "";
+            this.orderImportError = false;
+            if (!file.name.toLowerCase().endsWith(".xlsx")) {
+                this.orderImportMessage = "请选择 .xlsx 订单文件";
+                this.orderImportError = true;
+                event.target.value = "";
+                return;
+            }
+            this.orderImporting = true;
+            const data = new FormData();
+            data.append("file", file);
+            try {
+                const response = await fetch("/api/order-data/import", { method: "POST", body: data });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "订单导入失败");
+                const s = result.stats;
+                this.orderImportMessage = `导入完成：读取 ${s.input_rows} 条订单，合并写入 ${s.inserted_rows} 条，替换旧记录 ${s.replaced_rows} 条，未匹配商品 ${s.unmatched_rows} 条订单（已保存）；日期 ${s.date_start} 至 ${s.date_end}。`;
+                window.clearTimeout(this.orderSearchTimer);
+                this.orderPage = 1;
+                await Promise.all([this.loadOrderData(), this.loadOrderFilters()]);
+            } catch (error) {
+                this.orderImportMessage = `导入失败：${error.message}`;
+                this.orderImportError = true;
+            } finally {
+                this.orderImporting = false;
+                event.target.value = "";
             }
         },
         async loadStockData() {
@@ -1154,7 +1431,7 @@ const app = createApp({
                     headers: {"Content-Type": "application/json"},
                     body: JSON.stringify({
                         async: true, resume: true, workers: 2,
-                        skip_deal: true, exclude_activity: true,
+                        skip_deal: true, exclude_activity: false,
                         ...(kind === "compensate" ? {browser: "chrome"} : {}),
                     }),
                 });
@@ -1330,6 +1607,10 @@ const app = createApp({
             if (!item || item.children) return;
             this.activeView = item.key;
             this.closeDetail();
+            if (item.key === "order-data") {
+                this.loadOrderFilters();
+                this.loadOrderData();
+            }
             if (item.key === "data-overview") {
                 this.loadOverview();
             }
@@ -1346,6 +1627,11 @@ const app = createApp({
             }
             if (item.key === "todo-list" && this.todoRows.length === 0) {
                 this.loadTodoList();
+            }
+            if (item.key === "product-operation-logs") {
+                this.productOperationPage = 1;
+                this.loadProductOperationOptions();
+                this.loadProductOperationLogs();
             }
             if (item.key === "tag-groups" || item.key === "tags") {
                 this.settingsPage = 1;
@@ -1376,6 +1662,120 @@ const app = createApp({
                 this.settingsErrorMessage = error.message;
             } finally {
                 this.settingsLoading = false;
+            }
+        },
+        async loadProductOperationOptions() {
+            try {
+                const response = await fetch("/api/product-operation-logs/options");
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "选项加载失败");
+                this.productOperationTypes = result.types || [];
+                this.productOperationProducts = result.products || [];
+            } catch (error) {
+                this.showToast(error.message);
+            }
+        },
+        async loadProductOperationLogs() {
+            this.productOperationLoading = true;
+            this.productOperationError = "";
+            const query = new URLSearchParams({
+                page: this.productOperationPage,
+                page_size: this.productOperationPageSize,
+                search: this.productOperationSearch,
+                tag_id: this.productOperationTypeFilter,
+            });
+            try {
+                const response = await fetch(`/api/product-operation-logs?${query}`);
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "商品操作记录加载失败");
+                this.productOperationRows = result.rows;
+                this.productOperationTotal = result.total;
+                this.productOperationTotalPages = result.total_pages;
+            } catch (error) {
+                this.productOperationError = error.message;
+            } finally {
+                this.productOperationLoading = false;
+            }
+        },
+        filterProductOperationLogs() {
+            this.productOperationPage = 1;
+            this.loadProductOperationLogs();
+        },
+        openProductOperationForm(row = null) {
+            this.productOperationEditingId = row ? Number(row.id) : null;
+            this.productOperationForm = row
+                ? { asin_country: row.asin_country || "", tag_id: String(row.tag_id), remark: row.remark || "", operate_date: String(row.operate_date || "").slice(0, 10) }
+                : { asin_country: "", tag_id: this.productOperationTypes[0] ? String(this.productOperationTypes[0].id) : "", remark: "", operate_date: todayString() };
+            this.productOperationSaveError = "";
+            const product = this.productOperationProducts.find((item) => item.asin_country === this.productOperationForm.asin_country);
+            this.productOperationProductSearch = product ? this.productOperationProductLabel(product) : (row?.asin_country || "");
+            this.productOperationProductOpen = false;
+            this.productOperationProductIndex = -1;
+            this.productOperationFormOpen = true;
+        },
+        productOperationProductLabel(product) {
+            return `${product.name || product.asin} · ${product.asin} · ${product.country_name || ""}`;
+        },
+        searchProductOperationProducts() {
+            this.productOperationForm.asin_country = "";
+            this.productOperationProductOpen = true;
+            this.productOperationProductIndex = -1;
+        },
+        selectProductOperationProduct(product) {
+            this.productOperationForm.asin_country = product.asin_country;
+            this.productOperationProductSearch = this.productOperationProductLabel(product);
+            this.productOperationProductOpen = false;
+            this.productOperationProductIndex = -1;
+            this.productOperationSaveError = "";
+        },
+        handleProductOperationProductKey(event) {
+            if (event.key === "Escape" && this.productOperationProductOpen) {
+                event.preventDefault();
+                event.stopPropagation();
+                this.productOperationProductOpen = false;
+            } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                this.productOperationProductOpen = true;
+                const count = this.filteredProductOperationProducts.length;
+                this.productOperationProductIndex = count
+                    ? (this.productOperationProductIndex + (event.key === "ArrowDown" ? 1 : -1) + count) % count : -1;
+                this.$nextTick(() => document.getElementById(`operation-product-option-${this.productOperationProductIndex}`)?.scrollIntoView({ block: "nearest" }));
+            } else if (event.key === "Enter" && this.productOperationProductOpen) {
+                event.preventDefault();
+                const product = this.filteredProductOperationProducts[this.productOperationProductIndex];
+                if (product) this.selectProductOperationProduct(product);
+            }
+        },
+        closeProductOperationForm() {
+            if (this.productOperationSaving) return;
+            this.productOperationFormOpen = false;
+        },
+        async saveProductOperationLog() {
+            if (this.productOperationSaving) return;
+            if (!this.productOperationForm.asin_country) {
+                this.productOperationSaveError = "请从搜索结果中选择商品";
+                return;
+            }
+            this.productOperationSaving = true;
+            this.productOperationSaveError = "";
+            const editing = this.productOperationEditingId !== null;
+            try {
+                const response = await fetch(editing
+                    ? `/api/product-operation-logs/${this.productOperationEditingId}`
+                    : "/api/product-operation-logs", {
+                    method: editing ? "PATCH" : "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ ...this.productOperationForm, tag_id: Number(this.productOperationForm.tag_id) }),
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.message || "保存失败");
+                this.productOperationFormOpen = false;
+                await this.loadProductOperationLogs();
+                this.showToast(editing ? "商品操作记录已更新" : "商品操作记录已新增");
+            } catch (error) {
+                this.productOperationSaveError = error.message;
+            } finally {
+                this.productOperationSaving = false;
             }
         },
         openTagGroupForm(row = null) {
@@ -1495,7 +1895,8 @@ const app = createApp({
                 });
             }
         },
-        openEdit(row) {
+        async openEdit(row) {
+            await this.loadStatusTagOptions();
             this.detailRow = row;
             this.detailColumns = [];
             this.detailIsDayData = false;
@@ -1517,8 +1918,15 @@ const app = createApp({
             this.detailSaveError = "";
             const payload = {};
             this.editableFields.forEach((field) => {
-                payload[field.key] = this.detailForm[field.key] ?? "";
+                const next = this.detailForm[field.key] ?? "";
+                const original = this.detailRow[field.key] ?? "";
+                if (String(next) !== String(original)) payload[field.key] = next;
             });
+            if (!Object.keys(payload).length) {
+                this.detailSaving = false;
+                this.showToast("没有修改需要保存");
+                return;
+            }
 
             try {
                 const response = await fetch(`/api/basic-info/${this.detailRow.id}`, {
@@ -1578,6 +1986,25 @@ const app = createApp({
             }, 3500);
         },
         handleKeydown(event) {
+            if (this.productOperationFormOpen && event.key === "Escape") {
+                this.closeProductOperationForm();
+                return;
+            }
+            if (this.orderChartRow) {
+                if (event.key === "Escape") {
+                    this.closeOrderChart();
+                    return;
+                }
+                if (event.key === "Tab") {
+                    const elements = this.$refs.orderChartDialog?.querySelectorAll('button:not([disabled]), input:not([disabled]), [tabindex="0"]');
+                    if (elements?.length) {
+                        const first = elements[0], last = elements[elements.length - 1];
+                        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+                        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+                    }
+                }
+                return;
+            }
             if (event.key === "Escape") {
                 if (this.todoCreateOpen) {
                     this.closeTodoCreate();

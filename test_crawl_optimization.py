@@ -395,7 +395,7 @@ class ApiTests(unittest.TestCase):
             patch.object(web_app, "connect", return_value=connection),
             patch.object(web_app, "ensure_day_data_columns"),
             patch.object(web_app, "fetch_targets", return_value=[target(1), target(2)]),
-            patch.object(web_app, "fetch_repull_ids", side_effect=[[1, 2], [2], [2], [2], []]),
+            patch.object(web_app, "fetch_repull_ids", side_effect=[[1, 2], [2], [2], [2], [2], []]),
             patch.object(web_app, "crawl_with_compensation", side_effect=run),
         ):
             result = web_app.run_optimized_crawl(
@@ -431,7 +431,6 @@ class ApiTests(unittest.TestCase):
             patch.object(web_app, "fetch_targets", return_value=[target(1)]),
             patch.object(web_app, "fetch_repull_ids", side_effect=[[1], [1], [], [1], []]),
             patch.object(web_app, "crawl_with_compensation", side_effect=run),
-            patch.object(web_app, "fetch_product_link_unavailable_ids", return_value=set()),
         ):
             result = web_app.run_optimized_crawl(
                 {"browser": "edge", "workers": 2}, "compensate")

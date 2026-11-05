@@ -31,8 +31,8 @@ def load_scopes(operation):
             cursor.execute(
                 f"SELECT id, country FROM {table} "
                 "WHERE status = 1 AND TRIM(COALESCE(operation, '')) = %s "
-                "AND COALESCE(label, '') <> %s ORDER BY id ASC",
-                (operation, '链接挂了'),
+                "ORDER BY id ASC",
+                (operation,),
             )
             targets = list(cursor.fetchall())
 
@@ -92,7 +92,7 @@ def run(operation, api_url, timeout_seconds, resume_auth=False):
                     operation=operation, count_day=today, status='preparing',
                     order=list(scopes), scopes=scopes, results={}, waiting_auth=[],
                     waiting_auth_browser={}, complete=False, force_refresh=True,
-                    exclude_activity=False, skip_broken_links=True,
+                    exclude_activity=False,
                     total_targets=sum(map(len, scopes.values())),
                 )
                 owns_state = True

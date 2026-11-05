@@ -63,12 +63,14 @@ def page_status(session, site, start_browser=True):
                 if attempt == 19:
                     raise
     response.raise_for_status()
-    tabs = [t for t in response.json() if t.get('type') == 'page' and url_matches_site(t.get('url', ''), site)]
+    tabs = [t for t in response.json() if t.get('type') == 'page']
     if not tabs:
-        raise RuntimeError(f'{site}: no matching marketplace tab; check dedicated browser')
-    # Prefer the active first matching tab; do not navigate away from a challenge.
-    tab = tabs[0]
+        raise RuntimeError(f'{site}: dedicated browser has no page tab')
+    matching_tabs = [t for t in tabs if url_matches_site(t.get('url', ''), site)]
+    # Prefer the site's existing tab; otherwise repair an ordinary stale tab.
+    tab = (matching_tabs or tabs)[0]
     ws = websocket.create_connection(tab['webSocketDebuggerUrl'], timeout=10, suppress_origin=True)
+    redirected = False
     try:
         for attempt in range(20):
             request_id = attempt + 1
@@ -84,7 +86,21 @@ def page_status(session, site, start_browser=True):
                         raise RuntimeError(f'{site}: cannot inspect browser page')
                     break
             if not url_matches_site(value['url'], site):
-                raise RuntimeError(f'{site}: browser marketplace changed')
+                if is_blocked_html(value['html']):
+                    return 'authentication_required'
+                if redirected:
+                    raise RuntimeError(
+                        f'{site}: browser redirected to the wrong marketplace: {value["url"]}')
+                navigation_id = 100 + attempt
+                ws.send(json.dumps({'id': navigation_id, 'method': 'Page.navigate',
+                                    'params': {'url': f'https://{get_site_domain(site)}/'}}))
+                while True:
+                    message = json.loads(ws.recv())
+                    if message.get('id') == navigation_id:
+                        break
+                redirected = True
+                time.sleep(0.5)
+                continue
             # Missing-link pages can have an empty body (image-only errors).
             # They must not prevent proceeding to the next product.
             if is_product_link_unavailable_html(value['html']):

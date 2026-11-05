@@ -16,7 +16,6 @@ from amazon_importer.importer import (
     DEFAULT_PASSWORD,
     DEFAULT_PORT,
     DEFAULT_TABLE,
-    LABEL_VALUES,
     DEFAULT_USER,
     connect,
     fetch_columns,
@@ -30,7 +29,6 @@ from amazon_importer.day_crawler import (
     fetch_targets,
     price_matches_site,
     fetch_completed_day_ids,
-    fetch_product_link_unavailable_ids,
     is_hard_block_message,
 )
 from amazon_importer.crawl_jobs import CrawlJobs, CrawlBusy, crawl_lease
@@ -53,12 +51,11 @@ DISPLAY_COLUMNS = [
     ("picture", "图床"),
     ("asin", "ASIN"),
     ("link", "链接"),
-    ("label", "标签"),
     ("country_name", "国家"),
-    ("title", "标题"),
-    ("point", "五点"),
-    ("senior_a", "A+"),
-    ("ad_activity", "广告活动"),
+    ("product_status", "产品状态"),
+    ("inventory_status", "库存状态"),
+    ("ad_status", "广告状态"),
+    ("promotion_status", "促销状态"),
     ("deal_date", "活动开始日期"),
     ("deal_end_date", "活动结束日期"),
     ("stock_remark", "库存备注"),
@@ -75,6 +72,10 @@ BASIC_INFO_RECORD_COLUMNS = [
     "seller_sku",
     "country",
     "country_name",
+    "product_status",
+    "inventory_status",
+    "ad_status",
+    "promotion_status",
     "title",
     "point",
     "senior_a",
@@ -83,20 +84,24 @@ BASIC_INFO_RECORD_COLUMNS = [
     "obsolete_date",
     "status",
     "remark",
-    "ad_activity",
     "deal",
     "deal_date",
     "deal_end_date",
     "asin_country",
     "link",
-    "label",
     "stock_remark",
 ]
+
+STATUS_TAG_GROUPS = {
+    "product_status": "产品状态",
+    "inventory_status": "库存状态",
+    "ad_status": "广告状态",
+    "promotion_status": "促销状态",
+}
 
 BASIC_INFO_METRIC_CONDITIONS = {
     "senior_a_missing": "TRIM(COALESCE(`senior_a`, '')) = '无'",
     "deal_active": "TRIM(COALESCE(`deal`, '')) IN ('是', '开启', '已开启')",
-    "ad_inactive": "TRIM(COALESCE(`ad_activity`, '')) = '未开启'",
     "title_unmodified": "TRIM(COALESCE(`title`, '')) = '未修改'",
 }
 
@@ -113,11 +118,10 @@ EDITABLE_BASIC_FIELDS = {
     "obsolete_date",
     "status",
     "remark",
-    "ad_activity",
     "deal",
     "deal_date",
     "deal_end_date",
-    "label",
+    *STATUS_TAG_GROUPS,
     "stock_remark",
 }
 
@@ -127,11 +131,9 @@ TEXT_EDITABLE_FIELDS = {
     "country_name",
     "group",
     "remark",
-    "label",
     "title",
     "point",
     "senior_a",
-    "ad_activity",
     "deal",
     "deal_date",
     "deal_end_date",
@@ -148,25 +150,14 @@ EDITABLE_FIELD_LIMITS = {
     "country_name": 50,
     "group": 20,
     "remark": 255,
-    "label": 50,
     "title": 100,
     "point": 100,
     "senior_a": 100,
-    "ad_activity": 255,
     "deal": 100,
     "deal_date": 100,
     "deal_end_date": 100,
     "stock_remark": 1000,
 }
-
-LABEL_OPTIONS = [
-    {"value": "", "label": "正常"},
-    {"value": "新品链接", "label": "新品链接"},
-    {"value": "动销活动", "label": "动销活动"},
-    {"value": "清仓", "label": "清仓"},
-    {"value": "链接异常", "label": "链接异常"},
-]
-
 
 def database_config() -> dict[str, object]:
     return {
@@ -246,8 +237,6 @@ def normalize_edit_text(field_name: str, value) -> str | None:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string or null")
     normalized = value.strip()
-    if field_name == "label" and normalized and normalized not in LABEL_VALUES:
-        raise ValueError("label must be one of: 新品链接, 动销活动, 清仓, 链接异常, 链接挂了, or empty")
     limit = EDITABLE_FIELD_LIMITS.get(field_name)
     if limit and len(normalized) > limit:
         raise ValueError(f"{field_name} must be at most {limit} characters")
@@ -298,7 +287,7 @@ def normalize_edit_payload(payload: dict) -> dict[str, object]:
             normalized[field_name] = normalize_edit_integer(field_name, value, {0, 1})
         elif field_name == "status":
             normalized[field_name] = normalize_edit_integer(field_name, value, {0, 1})
-        elif field_name == "ad_activity":
+        elif field_name in STATUS_TAG_GROUPS:
             normalized[field_name] = normalize_edit_integer(field_name, value)
     if not normalized:
         raise ValueError("at least one editable field is required")
@@ -856,21 +845,31 @@ def basic_info():
                 "group",
                 "remark",
                 "link",
-                "label",
                 "title",
                 "point",
                 "senior_a",
-                "ad_activity",
                 "deal",
                 "deal_date",
                 "deal_end_date",
                 "stock_remark",
             ]
-            where_parts.append("(" + " OR ".join(
+            search_like = f"%{search.lower()}%"
+            search_parts = [
                 f"LOWER(CAST({quote_identifier(column)} AS CHAR)) LIKE %s"
                 for column in searchable_columns
-            ) + ")")
-            params.extend([f"%{search.lower()}%"] * len(searchable_columns))
+            ]
+            search_params: list[object] = [search_like] * len(searchable_columns)
+            for field_name, group_name in STATUS_TAG_GROUPS.items():
+                search_parts.append(
+                    "EXISTS (SELECT 1 FROM `amz_tag` st "
+                    "JOIN `amz_tag_group` sg ON sg.`id` = st.`group_id` "
+                    f"WHERE st.`id` = {table_sql}.{quote_identifier(field_name)} "
+                    "AND sg.`group_name` = %s "
+                    "AND LOWER(CAST(st.`tag_name` AS CHAR)) LIKE %s)"
+                )
+                search_params.extend([group_name, search_like])
+            where_parts.append("(" + " OR ".join(search_parts) + ")")
+            params.extend(search_params)
         if operation:
             where_parts.append("TRIM(COALESCE(`operation`, '')) = %s")
             params.append(operation)
@@ -922,6 +921,48 @@ def basic_info():
                 "summary": summary,
             }
         )
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@app.get("/api/basic-info/status-tags")
+def basic_info_status_tags():
+    try:
+        names = list(STATUS_TAG_GROUPS.values())
+        placeholders = ", ".join(["%s"] * len(names))
+        sql = f"""
+            SELECT g.`group_name`, g.`status` AS group_status,
+                   t.`id`, t.`tag_name`, t.`color`, t.`status` AS tag_status
+            FROM `amz_tag_group` g
+            LEFT JOIN `amz_tag` t ON t.`group_id` = g.`id`
+            WHERE g.`group_name` IN ({placeholders})
+            ORDER BY g.`sort_no`, g.`id`, t.`sort_no`, t.`id`
+        """
+        with connect(**database_config()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, names)
+                records = cursor.fetchall()
+
+        groups = {
+            group_name: {"status": 0, "tags": []}
+            for group_name in names
+        }
+        for record in records:
+            group = groups.get(record["group_name"])
+            if group is None:
+                continue
+            group["status"] = int(record.get("group_status") or 0)
+            if record.get("id") is not None:
+                group["tags"].append({
+                    "id": serialize_value(record["id"]),
+                    "tag_name": serialize_value(record.get("tag_name")),
+                    "color": serialize_value(record.get("color")),
+                    "status": int(record.get("tag_status") or 0),
+                })
+        return jsonify({"success": True, "groups": {
+            field: groups[group_name]
+            for field, group_name in STATUS_TAG_GROUPS.items()
+        }})
     except Exception as exc:
         return jsonify({"success": False, "message": str(exc)}), 500
 
@@ -1160,19 +1201,45 @@ def update_basic_info(record_id: int):
         return jsonify({"success": False, "message": str(exc)}), 400
 
     table_sql = quote_identifier(DEFAULT_TABLE)
-    set_sql = ", ".join(f"{quote_identifier(field)} = %s" for field in updates)
-    values = [updates[field] for field in updates]
     config = database_config()
 
     try:
         with connect(**config) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT `id` FROM {table_sql} WHERE `id` = %s LIMIT 1",
+                    f"SELECT `id`, {', '.join(quote_identifier(field) for field in STATUS_TAG_GROUPS)} "
+                    f"FROM {table_sql} WHERE `id` = %s LIMIT 1",
                     (record_id,),
                 )
-                if not cursor.fetchone():
+                current_record = cursor.fetchone()
+                if not current_record:
                     return jsonify({"success": False, "message": "record not found"}), 404
+
+                status_fields = [field for field in updates if field in STATUS_TAG_GROUPS and updates[field] is not None]
+                tags_by_id = {}
+                if status_fields:
+                    tag_ids = sorted({updates[field] for field in status_fields})
+                    tag_placeholders = ", ".join(["%s"] * len(tag_ids))
+                    cursor.execute(
+                        "SELECT t.`id`, t.`status` AS tag_status, g.`group_name`, "
+                        "g.`status` AS group_status FROM `amz_tag` t "
+                        "JOIN `amz_tag_group` g ON g.`id` = t.`group_id` "
+                        f"WHERE t.`id` IN ({tag_placeholders})",
+                        tag_ids,
+                    )
+                    tags_by_id = {int(row["id"]): row for row in cursor.fetchall()}
+                for field_name in status_fields:
+                    tag_id = updates[field_name]
+                    tag = tags_by_id.get(tag_id)
+                    if not tag or tag["group_name"] != STATUS_TAG_GROUPS[field_name]:
+                        raise ValueError(f"{field_name} must reference a tag in {STATUS_TAG_GROUPS[field_name]}")
+                    current_id = current_record.get(field_name)
+                    unchanged = current_id is not None and int(current_id) == tag_id
+                    if (int(tag.get("tag_status") or 0) != 1 or int(tag.get("group_status") or 0) != 1) and not unchanged:
+                        raise ValueError(f"{field_name} must reference an enabled tag")
+
+                set_sql = ", ".join(f"{quote_identifier(field)} = %s" for field in updates)
+                values = [updates[field] for field in updates]
 
                 cursor.execute(
                     f"UPDATE {table_sql} SET {set_sql} WHERE `id` = %s",
@@ -1192,6 +1259,12 @@ def update_basic_info(record_id: int):
                 "row": {field: serialize_value(value) for field, value in record.items()},
             }
         )
+    except ValueError as exc:
+        try:
+            connection.rollback()
+        except (NameError, UnboundLocalError):
+            pass
+        return jsonify({"success": False, "message": str(exc)}), 400
     except Exception as exc:
         try:
             connection.rollback()
@@ -1253,10 +1326,11 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
             # must see those commits instead of an old REPEATABLE READ view.
             connection.autocommit(True)
             selectors = {key: payload.get(key) for key in ("data_id", "data_ids", "asin_country", "limit")}
-            targets = fetch_targets(connection, **selectors, exclude_activity=payload.get("exclude_activity", True),
-                                    exclude_broken_links=payload.get("skip_broken_links", False))
-            if payload.get('pause_on_auth') and len({t['country'] for t in targets}) > 1:
-                raise ValueError('认证暂停只允许单站点任务，避免误停其他站点')
+            targets = fetch_targets(connection, **selectors, exclude_activity=payload.get("exclude_activity", True))
+            site_count = len({t['country'] for t in targets})
+            if (payload.get('pause_on_auth') and site_count > 1
+                    and (payload.get('parallel_sites') != 2 or site_count > 2)):
+                raise ValueError('Authentication pause supports at most two marketplaces per job')
             def item_progress(record=None, **values):
                 if (record and payload.get('pause_on_auth') and stop_event is not None
                         and not stop_event.is_set()
@@ -1278,7 +1352,6 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
                          count_day=today.isoformat(), pending=len(pending))
             kwargs = dict(data_ids=scope_ids, resume=payload.get("resume", True),
                           fill_missing_only=kind == "compensate", workers=min(2, max(1, int(payload.get("workers", 2)))),
-                          exclude_broken_links=payload.get("skip_broken_links", False),
                           connection_factory=lambda: connect(**config), progress_callback=item_progress if payload.get('pause_on_auth') else progress,
                           stop_event=stop_event, count_day=today)
             if progress and kwargs["resume"]:
@@ -1286,12 +1359,24 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
             result = crawl_with_compensation(connection, crawl_kwargs=kwargs,
                                              count_day=today.isoformat(), max_rounds=0)
             result.update(date=today.isoformat(), target_count=len(scope_ids))
-            def failed_ids():
+            def latest_items_by_id():
                 latest = {int(item["data_id"]): item for item in result["items"]}
-                return {target_id for target_id, item in latest.items() if item.get("db_action") == "failed"}
+                return latest
+            def failed_ids():
+                return {target_id for target_id, item in latest_items_by_id().items()
+                        if item.get("db_action") == "failed"}
+            def unavailable_ids():
+                return {target_id for target_id, item in latest_items_by_id().items()
+                        if item.get("db_action") == "link_unavailable"}
+            def pending_ids():
+                return sorted((set(fetch_repull_ids(connection, today.isoformat(), scope_ids))
+                               - unavailable_ids()) | failed_ids())
             if progress:
+                first_pending = pending_ids()
+                result.update(remaining_re_pull=len(first_pending),
+                              remaining_missing=len(first_pending), complete=not first_pending)
                 progress(first_result={key: value for key, value in result.items() if key != "items"},
-                         pending=result["remaining_re_pull"])
+                         pending=len(first_pending))
             # A background job publishes the first result before compensation.
             # Synchronous callers receive the first result immediately.
             rounds = min(2, max(1, int(payload.get("compensation_rounds", 2))))
@@ -1299,7 +1384,7 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
             run_compensation = kind == "compensate" or (progress and payload.get("auto_compensate", True))
             if run_compensation:
                 for round_index in range(1 if kind == "compensate" else 0, rounds):
-                    pending = sorted(set(fetch_repull_ids(connection, today.isoformat(), scope_ids)) | failed_ids())
+                    pending = pending_ids()
                     if not pending or (stop_event and stop_event.is_set()):
                         break
                     if stop_event:
@@ -1324,8 +1409,7 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
                     finally:
                         restore_env(compensation_env)
                     merge_crawl_results(result, current)
-                edge_pending = sorted(set(fetch_repull_ids(
-                    connection, today.isoformat(), scope_ids)) | failed_ids())
+                edge_pending = pending_ids()
                 if (compensation_browser != "edge" and edge_pending
                         and not (stop_event and stop_event.is_set())):
                     if progress:
@@ -1349,14 +1433,14 @@ def run_optimized_crawl(payload, kind, progress=None, stop_event=None):
             # Every summary is based on persisted daily records, with a single
             # data_id per marketplace. Log rows and repeated ASINs are not units
             # of progress (one ASIN may be sold in several countries).
-            pending = sorted(set(fetch_repull_ids(connection, today.isoformat(), scope_ids)) | failed_ids())
+            pending = pending_ids()
             result.update(remaining_re_pull=len(pending), remaining_missing=len(pending), complete=not pending)
-            unavailable_ids = fetch_product_link_unavailable_ids(connection, scope_ids)
-            valid_scope_count = len(set(scope_ids) - unavailable_ids)
-            result["stats"].update(unique_targets=valid_scope_count,
-                                   complete_targets=valid_scope_count-len(pending),
+            unavailable = unavailable_ids()
+            valid_scope_count = len(set(scope_ids) - unavailable)
+            result["stats"].update(unique_targets=len(set(scope_ids)),
+                                   complete_targets=max(0, valid_scope_count-len(pending)),
                                    incomplete_targets=len(pending),
-                                   link_unavailable_targets=len(unavailable_ids))
+                                   link_unavailable_targets=len(unavailable))
             latest = {int(item["data_id"]): item for item in result["items"]}
             result["stats"]["failed_targets"] = sum(
                 latest.get(target_id, {}).get("db_action") == "failed" for target_id in pending)
@@ -2073,6 +2157,13 @@ def complete_todo(record_id: int):
         except (NameError, UnboundLocalError):
             pass
         return jsonify({"success": False, "message": str(exc)}), 500
+
+
+from amazon_importer.order_data import register_order_routes
+from amazon_importer.product_operation_logs import register_product_operation_routes
+
+register_order_routes(app, lambda: connect(**database_config()))
+register_product_operation_routes(app, lambda: connect(**database_config()))
 
 
 if __name__ == "__main__":

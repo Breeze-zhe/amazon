@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Amazon 数据中心</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=20261021_tag_crud_rgb">
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=20261103_order_operation_markers">
 </head>
 <body>
     <div id="app" class="app-shell">
@@ -117,6 +117,116 @@
                 </div>
             </section>
 
+            <section v-else-if="activeView === 'operation-logs'" class="content-panel placeholder-view">
+                <div class="panel-heading">
+                    <div>
+                        <h2>操作日志</h2>
+                        <p>查看系统操作记录</p>
+                    </div>
+                </div>
+                <div class="empty-state">
+                    <div>
+                        <span class="empty-icon" aria-hidden="true">◷</span>
+                        <h2>日志数据源尚未接入</h2>
+                        <p>当前系统暂无可展示的操作日志记录。</p>
+                    </div>
+                </div>
+            </section>
+
+            <section v-else-if="activeView === 'product-operation-logs'" class="content-panel">
+                <div class="panel-heading">
+                    <div><h2>商品操作日志</h2><p>按商品 ASIN＋国家关联操作记录</p></div>
+                    <div class="record-count">共 [[ productOperationTotal ]] 条</div>
+                </div>
+                <div class="toolbar product-operation-toolbar">
+                    <label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input v-model.trim="productOperationSearch" type="search" placeholder="搜索产品、ASIN、操作类型或备注..." @keydown.enter="filterProductOperationLogs" @input="filterProductOperationLogs"></label>
+                    <label class="operation-filter"><span>操作类型</span><select v-model="productOperationTypeFilter" @change="filterProductOperationLogs"><option value="">全部类型</option><option v-for="type in productOperationTypes" :key="type.id" :value="String(type.id)">[[ type.tag_name ]]</option></select></label>
+                    <button class="row-action primary" type="button" @click="openProductOperationForm()">新增记录</button>
+                    <button class="clear-button" type="button" :disabled="productOperationLoading" @click="loadProductOperationLogs">刷新</button>
+                </div>
+                <div v-if="productOperationLoading" class="empty-state" role="status">正在加载商品操作记录...</div>
+                <div v-else-if="productOperationError" class="empty-state error-message" role="alert">加载失败：[[ productOperationError ]]</div>
+                <div v-else class="table-wrap">
+                    <table class="product-operation-table">
+                        <thead><tr><th>产品名称</th><th>图床</th><th>ASIN</th><th>操作类型</th><th>备注</th><th>操作日期</th><th>操作</th></tr></thead>
+                        <tbody>
+                            <tr v-for="row in productOperationRows" :key="row.id">
+                                <td>[[ row.name || '商品资料已不存在' ]]</td>
+                                <td><span class="picture-cell"><a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer" title="打开原图"><img class="picture-thumbnail" :src="row.picture" :alt="`${row.name || row.asin}图片`" @error="handlePictureError"><span class="picture-fallback" hidden>图片加载失败</span></a><span v-else class="picture-empty">暂无图片</span></span></td>
+                                <td>[[ row.asin || '—' ]]</td><td><span class="status-tag" :style="tagColorStyle(row.operation_type_color)">[[ row.operation_type ]]</span></td><td class="product-operation-remark">[[ row.remark ]]</td><td>[[ String(row.operate_date || '').slice(0, 10) ]]</td>
+                                <td><button class="row-action primary" type="button" @click="openProductOperationForm(row)">编辑</button></td>
+                            </tr>
+                            <tr v-if="productOperationRows.length === 0"><td colspan="7" class="table-message">暂无商品操作记录</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="table-footer">
+                    <span>总数：[[ productOperationTotal ]] 条 · 第 [[ productOperationPage ]] / [[ productOperationTotalPages ]] 页</span>
+                    <label class="page-size-control">每页<select v-model.number="productOperationPageSize" :disabled="productOperationLoading" @change="filterProductOperationLogs"><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option></select></label>
+                    <div class="pagination"><button type="button" title="上一页" :disabled="productOperationPage <= 1 || productOperationLoading" @click="productOperationPage--; loadProductOperationLogs()">‹</button><button type="button" title="下一页" :disabled="productOperationPage >= productOperationTotalPages || productOperationLoading" @click="productOperationPage++; loadProductOperationLogs()">›</button></div>
+                </div>
+            </section>
+
+            <section v-else-if="activeView === 'order-data'" class="content-panel order-panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>订单列表</h2>
+                        <p>每日包裹数量 · 按上传文件统计<span v-if="orderLatestDay"> · [[ orderDates[orderDates.length - 1] ]] 至 [[ orderLatestDay ]]</span></p>
+                    </div>
+                    <div class="record-count">共 [[ orderTotal ]] 个商品</div>
+                </div>
+                <div class="toolbar order-toolbar">
+                    <label class="search-box">
+                        <span class="search-icon" aria-hidden="true">⌕</span>
+                        <input v-model.trim="orderAsin" type="search" placeholder="搜索 ASIN..." aria-label="搜索订单 ASIN" autocomplete="off" @input="scheduleOrderSearch" @keydown.enter="filterOrders">
+                    </label>
+                    <button class="refresh-button" type="button" :disabled="orderImporting" @click="triggerOrderImport">[[ orderImporting ? '导入中...' : '导入订单' ]]</button>
+                    <input ref="orderImportInput" type="file" accept=".xlsx" hidden @change="importOrderData">
+                    <label class="operation-filter"><span>运营</span>
+                        <select v-model="orderOperation" @change="filterOrders"><option value="">全部运营</option><option v-for="operation in orderOperations" :key="operation" :value="operation">[[ operation ]]</option></select>
+                    </label>
+                    <label class="operation-filter"><span>站点</span>
+                        <select v-model="orderSite" @change="filterOrders"><option value="">全部站点</option><option v-for="site in orderSites" :key="site" :value="site">[[ site ]]</option></select>
+                    </label>
+                    <button class="clear-button" type="button" @click="clearOrderFilters">清除筛选</button>
+                    <button class="clear-button" type="button" :disabled="orderLoading" @click="loadOrderData">刷新</button>
+                </div>
+                <p class="order-import-hint">按账号、ASIN＋国家、下单日期合并，包裹数量、SKU 数量及金额相加。请导入完整的账号每日数据；同账号、同日期的旧数据将被替换。</p>
+                <p v-if="orderImportMessage" class="order-import-result" :class="{ 'error-message': orderImportError }" role="status">[[ orderImportMessage ]]</p>
+                <div v-if="orderLoading" class="empty-state" role="status">正在加载订单...</div>
+                <div v-else-if="orderError" class="empty-state error-message" role="alert">[[ orderError ]]</div>
+                <div v-else-if="!orderLatestDay" class="empty-state">暂无订单数据，请先导入 .xlsx 订单文件。</div>
+                <div v-else class="table-wrap order-table-wrap" tabindex="0" aria-label="最近 30 天订单，可横向滚动">
+                    <table class="order-table">
+                        <thead><tr>
+                            <th class="order-product-column">产品信息 / 运营 / 站点</th>
+                            <th class="order-picture-column">图床</th>
+                            <th class="order-asin-column">ASIN / 链接</th>
+                            <th v-for="day in orderDates" :key="day" class="order-day-column" :title="day">[[ day ]]</th>
+                            <th class="order-total-column">30 天合计</th>
+                        </tr></thead>
+                        <tbody>
+                            <tr v-if="orderRows.length === 0"><td :colspan="orderDates.length + 4" class="table-message">没有找到匹配的商品</td></tr>
+                            <tr v-for="row in orderRows" :key="row.id">
+                                <td class="order-product-column"><strong>[[ row.name || '未命名商品' ]]</strong><span class="order-product-meta">[[ row.operation || '未分配运营' ]] · [[ row.country_name || '未设置站点' ]]</span></td>
+                                <td class="order-picture-column"><span class="picture-cell">
+                                    <a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer" title="打开原图"><img class="picture-thumbnail" :src="row.picture" :alt="`${row.name || row.asin}图片`" @error="handlePictureError"><span class="picture-fallback" hidden>图片加载失败</span></a>
+                                    <span v-else class="picture-empty">暂无图片</span>
+                                </span></td>
+                                <td class="order-asin-column"><strong>[[ row.asin ]]</strong><a v-if="row.link" class="order-product-meta product-link" :href="row.link" target="_blank" rel="noopener noreferrer">打开商品 ↗</a><span v-else class="order-product-meta empty-cell">暂无链接</span></td>
+                                <td v-for="day in orderDates" :key="day" class="order-day-column" :class="{ 'empty-cell': !row.daily_orders[day] }"><span class="order-day-content"><span>[[ row.daily_orders[day] ]]</span><span v-if="row.daily_operations[day]" class="order-operation-marker" role="img" :title="orderOperationTooltip(row.daily_operations[day])" :aria-label="`操作日志：${orderOperationTooltip(row.daily_operations[day])}`">★</span></span></td>
+                                <td class="order-total-column">[[ row.total_orders ]]</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="table-footer">
+                    <span>总数：[[ orderTotal ]] 个商品 · 第 [[ orderPage ]] / [[ orderTotalPages ]] 页</span>
+                    <label class="page-size-control">每页<select v-model.number="orderPageSize" :disabled="orderLoading" @change="filterOrders"><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option></select></label>
+                    <div class="pagination"><button type="button" title="上一页" :disabled="orderPage <= 1 || orderLoading" @click="orderPage--; loadOrderData()">‹</button><button type="button" title="下一页" :disabled="orderPage >= orderTotalPages || orderLoading" @click="orderPage++; loadOrderData()">›</button></div>
+                </div>
+            </section>
+
             <section v-else-if="activeView === 'basic-info'" class="content-panel">
                 <div class="panel-heading">
                     <div>
@@ -181,7 +291,7 @@
                 </div>
 
                 <div class="table-wrap">
-                    <table>
+                    <table class="basic-info-table">
                         <thead>
                             <tr>
                                 <th v-for="(column, columnIndex) in columns" :key="fieldKey(column) || columnIndex">[[ fieldLabel(column) ]]</th>
@@ -211,12 +321,14 @@
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         title="打开 Amazon 商品链接"
-                                    >[[ row.link ]]</a>
+                                        :aria-label="`打开商品：${row.link}`"
+                                    >打开商品</a>
                                     <span
-                                        v-else-if="isField(column, 'label')"
-                                        class="label-badge"
-                                        :class="labelClass(row.label)"
-                                    >[[ formatLabel(row.label) ]]</span>
+                                        v-else-if="isStatusTagField(column)"
+                                        class="status-tag"
+                                        :class="statusTagClass(row, column)"
+                                        :style="statusTagStyle(row, column)"
+                                    >[[ statusTagName(row, column) ]]</span>
                                     <span v-else-if="isField(column, 'picture')" class="picture-cell">
                                         <a
                                             v-if="row.picture"
@@ -236,7 +348,7 @@
                                         </a>
                                         <span v-else class="picture-empty">暂无图片</span>
                                     </span>
-                                    <a v-else-if="isField(column, 'link') && row.link" class="product-link" :href="row.link" target="_blank" rel="noopener noreferrer">[[ row.link ]]</a>
+                                    <a v-else-if="isField(column, 'link') && row.link" class="product-link" :href="row.link" title="打开 Amazon 商品链接" :aria-label="`打开商品：${row.link}`" target="_blank" rel="noopener noreferrer">打开商品</a>
                                     <span v-else-if="isField(column, 'link')" class="empty-cell">暂无</span>
                                     <span v-else-if="isField(column, 'picture')" class="picture-cell">
                                         <a v-if="row.picture" class="picture-link" :href="row.picture" target="_blank" rel="noopener noreferrer">
@@ -253,6 +365,7 @@
                                         <button class="row-action primary" type="button" @click="openEdit(row)">编辑</button>
                                         <button class="row-action" type="button" @click="showComingSoon('广告活动', row)">广告活动</button>
                                         <button class="row-action" type="button" @click="openStockDetail(row)">库存</button>
+                                        <button class="row-action order-chart-button" type="button" @click="openOrderChart(row)">订单</button>
                                     </div>
                                 </td>
                             </tr>
@@ -376,8 +489,9 @@
                 <div v-if="scheduledBatch" role="status" aria-live="polite" class="toolbar">
                     <span>定时批次 [[ scheduledBatch.count_day ]]：
                         [[ ({preparing:'准备中',running:'执行中',waiting_auth:'等待人工认证',finished:'已结束',paused:'已暂停',failed:'异常停止',interrupted:'调度已中断'})[scheduledBatch.status] || scheduledBatch.status ]]
-                        <span v-if="scheduledBatch.current_site">，当前 [[ scheduledNames[scheduledBatch.current_site] || scheduledBatch.current_site ]]</span>
-                        <span v-if="scheduledBatch.waiting_auth && scheduledBatch.waiting_auth.length">；待认证：[[ scheduledBatch.waiting_auth.map(site => scheduledNames[site] || site).join('、') ]]。请在对应 Chrome 窗口完成人工认证。</span>
+                        <span v-if="scheduledBatch.current_sites && scheduledBatch.current_sites.length">，当前 [[ scheduledBatch.current_sites.map(site => scheduledNames[site] || site).join('、') ]]</span>
+                        <span v-else-if="scheduledBatch.current_site">，当前 [[ scheduledNames[scheduledBatch.current_site] || scheduledBatch.current_site ]]</span>
+                        <span v-if="scheduledBatch.waiting_auth && scheduledBatch.waiting_auth.length">；待认证：[[ scheduledBatch.waiting_auth.map(site => scheduledNames[site] || site).join('、') ]]。请在对应浏览器窗口完成人工认证。</span>
                         <span v-if="scheduledBatch.status === 'finished'">（[[ scheduledBatch.complete ? '数据完整' : '仍有缺失，请检查补拉' ]]）</span>
                         <span v-if="scheduledBatch.error">，[[ scheduledBatch.error ]]</span>
                     </span>
@@ -665,6 +779,47 @@
             </section>
         </main>
 
+        <div v-if="orderChartRow" class="modal-backdrop" @click.self="closeOrderChart">
+            <section ref="orderChartDialog" class="detail-modal order-chart-modal" role="dialog" aria-modal="true" aria-labelledby="order-chart-title">
+                <div class="modal-header">
+                    <div><h2 id="order-chart-title">订单趋势</h2><p class="order-chart-product">[[ orderChartRow.name || orderChartRow.asin ]] · [[ orderChartRow.asin ]] · [[ orderChartRow.country_name ]]</p></div>
+                    <button ref="orderChartClose" class="modal-close" type="button" aria-label="关闭订单趋势" @click="closeOrderChart">×</button>
+                </div>
+                <form class="order-chart-filters" @submit.prevent="loadOrderChart(false)">
+                    <label class="date-filter"><span>开始日期</span><input v-model="orderChartStart" type="date" :disabled="orderChartLoading" required aria-label="订单开始日期"></label>
+                    <label class="date-filter"><span>结束日期</span><input v-model="orderChartEnd" type="date" :disabled="orderChartLoading" required aria-label="订单结束日期"></label>
+                    <button class="refresh-button" type="submit" :disabled="orderChartLoading">[[ orderChartLoading ? '查询中...' : '查询' ]]</button>
+                    <button class="clear-button" type="button" :disabled="orderChartLoading" @click="loadOrderChart(true)">最近 30 天</button>
+                </form>
+                <div v-if="orderChartLoading" class="order-chart-message" role="status">正在查询订单...</div>
+                <div v-else-if="orderChartError" class="order-chart-message error-message" role="alert">[[ orderChartError ]]</div>
+                <div v-else-if="!orderChartResult || orderChartResult.points.length === 0" class="order-chart-message">暂无订单数据，可选择日期范围查询。</div>
+                <template v-else>
+                    <div class="order-chart-summary"><span>[[ orderChartResult.start_date ]] 至 [[ orderChartResult.end_date ]] · 按包裹数量统计</span><strong>合计 [[ orderChartResult.total_orders ]] 单</strong></div>
+                    <p v-if="orderChartResult.total_orders === 0" class="order-chart-zero">该商品在所选日期范围内暂无订单。</p>
+                    <div class="order-chart-scroll" tabindex="0" aria-label="订单柱状图，可横向滚动查看更多日期">
+                        <svg class="order-bar-chart" :viewBox="`0 0 ${orderChartGeometry.width} 360`" :style="{ minWidth: `${orderChartGeometry.width}px` }" role="img" aria-labelledby="order-chart-svg-title">
+                            <title id="order-chart-svg-title">[[ orderChartRow.asin ]] [[ orderChartRow.country_name ]] 每日订单数柱状图</title>
+                            <text x="16" y="20" class="order-axis-label">订单数</text>
+                            <g v-for="tick in orderChartGeometry.ticks" :key="tick.value">
+                                <line x1="56" :x2="orderChartGeometry.width - 24" :y1="tick.y" :y2="tick.y" class="order-chart-grid"></line>
+                                <text x="46" :y="tick.y + 4" text-anchor="end" class="order-tick-label">[[ tick.value ]]</text>
+                            </g>
+                            <line x1="56" x2="56" y1="40" y2="260" class="order-chart-axis"></line>
+                            <line x1="56" :x2="orderChartGeometry.width - 24" y1="260" y2="260" class="order-chart-axis"></line>
+                            <g v-for="bar in orderChartGeometry.bars" :key="bar.date" class="order-bar-group" tabindex="0" :aria-label="`${bar.date}：${bar.quantity} 单`">
+                                <title>[[ bar.date ]]：[[ bar.quantity ]] 单</title>
+                                <rect :x="bar.x - bar.width / 2" :y="bar.quantity ? bar.y : 259" :width="bar.width" :height="Math.max(1, bar.height)" rx="2" class="order-bar" :class="{ 'order-bar-zero': !bar.quantity }"></rect>
+                                <text v-if="bar.quantity" :x="bar.x" :y="bar.y - 7" text-anchor="middle" class="order-bar-value">[[ bar.quantity ]]</text>
+                                <text :transform="`translate(${bar.x}, 277) rotate(45)`" class="order-date-label">[[ bar.date ]]</text>
+                            </g>
+                            <text :x="orderChartGeometry.width / 2" y="350" text-anchor="middle" class="order-axis-label">日期</text>
+                        </svg>
+                    </div>
+                </template>
+            </section>
+        </div>
+
         <div v-if="detailRow" class="modal-backdrop" @click.self="closeDetail">
             <section class="detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-title">
                 <div class="modal-header">
@@ -685,11 +840,6 @@
                                 target="_blank"
                                 rel="noopener noreferrer"
                             >[[ detailForm.link ]]</a>
-                            <span
-                                v-else-if="isField(field, 'label')"
-                                class="label-badge"
-                                :class="labelClass(detailForm.label)"
-                            >[[ formatLabel(detailForm.label) ]]</span>
                             <strong v-else>[[ detailForm[fieldKey(field)] || '暂无' ]]</strong>
                         </div>
                     </div>
@@ -705,6 +855,10 @@
                             <select v-else-if="field && field.type === 'select'" v-model="detailForm[fieldKey(field)]">
                                 <option value="">暂无</option>
                                 <option v-for="option in field.options" :key="option.value" :value="option.value">[[ option.label ]]</option>
+                            </select>
+                            <select v-else-if="field && field.type === 'tag-select'" v-model="detailForm[fieldKey(field)]">
+                                <option value="">暂无</option>
+                                <option v-for="option in statusTagOptions(field)" :key="option.value" :value="option.value" :disabled="option.disabled">[[ option.label ]]</option>
                             </select>
                             <input
                                 v-else
@@ -749,10 +903,11 @@
                             <span v-if="!detailRow.deal || detailRow.deal.length === 0" class="empty-cell">暂无</span>
                         </span>
                         <span
-                            v-else-if="isField(column, 'label')"
-                            class="label-badge"
-                            :class="labelClass(detailRow.label)"
-                        >[[ formatLabel(detailRow.label) ]]</span>
+                            v-else-if="isStatusTagField(column)"
+                            class="status-tag"
+                            :class="statusTagClass(detailRow, column)"
+                            :style="statusTagStyle(detailRow, column)"
+                        >[[ statusTagName(detailRow, column) ]]</span>
                         <strong v-else-if="isField(column, 'status')">[[ formatStatus(detailRow.status) ]]</strong>
                         <strong v-else-if="isField(column, 'buy_box')">[[ formatBuyBox(detailRow.buy_box) ]]</strong>
                         <strong v-else>[[ rawFieldValue(detailRow, column) || '暂无' ]]</strong>
@@ -815,6 +970,29 @@
                     <div class="trend-chart" v-html="trendMarkup"></div>
                     <div v-if="!trendLoading && !trendErrorMessage && (!detailTrend || !detailTrend.points || detailTrend.points.length === 0)" class="trend-empty">暂无趋势数据</div>
                 </div>
+            </section>
+        </div>
+
+        <div v-if="productOperationFormOpen" class="modal-backdrop" @click.self="closeProductOperationForm">
+            <section class="detail-modal todo-modal product-operation-form" role="dialog" aria-modal="true" aria-labelledby="product-operation-form-title">
+                <div class="modal-header"><h2 id="product-operation-form-title">[[ productOperationEditingId ? '编辑商品操作记录' : '新增商品操作记录' ]]</h2><button class="modal-close" type="button" title="关闭" :disabled="productOperationSaving" @click="closeProductOperationForm">×</button></div>
+                <form class="edit-form" @submit.prevent="saveProductOperationLog">
+                    <div class="edit-grid">
+                        <div class="edit-field edit-field-wide product-operation-picker" @focusout="productOperationProductOpen = false">
+                            <label for="product-operation-product-search">产品</label>
+                            <input id="product-operation-product-search" v-model="productOperationProductSearch" type="search" role="combobox" autocomplete="off" placeholder="搜索商品名称、ASIN 或站点" required aria-autocomplete="list" aria-controls="product-operation-product-options" :aria-expanded="productOperationProductOpen" :aria-activedescendant="productOperationProductOpen && productOperationProductIndex >= 0 ? `operation-product-option-${productOperationProductIndex}` : undefined" @input="searchProductOperationProducts" @focus="productOperationProductOpen = true" @click="productOperationProductOpen = true" @keydown="handleProductOperationProductKey">
+                            <div v-if="productOperationProductOpen" id="product-operation-product-options" class="product-operation-product-options" role="listbox" aria-label="商品搜索结果">
+                                <div v-for="(product, index) in filteredProductOperationProducts" :id="`operation-product-option-${index}`" :key="product.asin_country" class="product-operation-product-option" :class="{ 'is-active': index === productOperationProductIndex }" role="option" :aria-selected="productOperationForm.asin_country === product.asin_country" @mousedown.prevent @click="selectProductOperationProduct(product)">[[ productOperationProductLabel(product) ]]</div>
+                                <p v-if="filteredProductOperationProducts.length === 0" class="product-operation-product-empty" role="status">没有找到匹配的商品</p>
+                            </div>
+                        </div>
+                        <label class="edit-field"><span>操作类型</span><select v-model="productOperationForm.tag_id" required><option value="" disabled>请选择操作类型</option><option v-for="type in productOperationTypes" :key="type.id" :value="String(type.id)">[[ type.tag_name ]]</option></select></label>
+                        <label class="edit-field"><span>操作日期</span><input v-model="productOperationForm.operate_date" type="date" required></label>
+                        <label class="edit-field edit-field-wide"><span>备注</span><textarea v-model.trim="productOperationForm.remark" maxlength="4000" rows="4"></textarea></label>
+                    </div>
+                    <p v-if="productOperationSaveError" class="form-error" role="alert">[[ productOperationSaveError ]]</p>
+                    <div class="modal-footer"><button class="modal-button secondary" type="button" :disabled="productOperationSaving" @click="closeProductOperationForm">取消</button><button class="modal-button primary product-operation-form-submit" type="submit" :disabled="productOperationSaving || productOperationTypes.length === 0 || productOperationProducts.length === 0">[[ productOperationSaving ? '保存中...' : '保存' ]]</button></div>
+                </form>
             </section>
         </div>
 
@@ -912,6 +1090,6 @@
     </div>
 
     <script src="{{ url_for('static', filename='vue.global.prod.js') }}?v=3.5.18"></script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20261021_tag_crud_rgb"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20261103_order_operation_markers"></script>
 </body>
 </html>

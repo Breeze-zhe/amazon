@@ -21,7 +21,6 @@ DEFAULT_DATABASE = "amazon"
 DEFAULT_TABLE = "amazon_data"
 
 COUNTRY_SOURCE_HEADER = "简称"
-LABEL_VALUES = {"新品链接", "动销活动", "清仓", "链接异常", "链接挂了"}
 
 EXPLICIT_HEADER_TO_COLUMN = {
     "ASIN": "asin",
@@ -36,22 +35,18 @@ EXPLICIT_HEADER_TO_COLUMN = {
     "标题": "title",
     "五点": "point",
     "A+": "senior_a",
-    "广告": "ad_activity",
-    "广告活动": "ad_activity",
     "活动": "deal",
     "活动开始时间": "deal_date",
     "活动开始日期": "deal_date",
     "活动结束时间": "deal_end_date",
     "活动结束日期": "deal_end_date",
     "库存备注": "stock_remark",
-    "label": "label",
     "图床": "picture",
     "图床链接": "picture",
     "图片": "picture",
     "图片链接": "picture",
     "pickture": "picture",
     "picture": "picture",
-    "标签": "label",
 }
 
 SPECIAL_HEADER_TO_COLUMN = {
@@ -72,7 +67,6 @@ COLUMN_ALIASES = {
     "select_date": ["接手月份"],
     "obsolete_date": ["淘汰月份"],
     "status": ["状态"],
-    "ad_activity": ["广告"],
     "deal": ["活动"],
     "deal_date": ["活动开始时间"],
     "asin_country": ["ASIN+国家"],
@@ -83,7 +77,6 @@ SOURCE_TEXT_COLUMNS = {
     "title",
     "point",
     "senior_a",
-    "ad_activity",
     "deal",
     "deal_date",
     "deal_end_date",
@@ -143,9 +136,6 @@ def normalize_db_value(column: str, value: Any) -> Any:
         return clean_value(value)
     if column.endswith("_date") or column == "select_date":
         return normalize_date(value)
-    if column == "label":
-        normalized = clean_value(value)
-        return normalized if normalized in LABEL_VALUES else None
     return clean_value(value)
 
 
